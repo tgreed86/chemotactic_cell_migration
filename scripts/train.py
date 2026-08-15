@@ -35,6 +35,12 @@ generator; setting ``flux_loss_weight=0`` preserves node-only training. Both
 weight settings are ignored by SAGEConv and MeshGraphNet, which use the
 standard unweighted node objective.
 
+By default, FluxGraphNet's face decoder emits transport in physical units.
+Setting ``decode_normalized_flux=true`` instead makes it emit a dimensionless
+standardized value and applies ``flux_mean + flux_std * decoded_flux`` before
+the conservative finite-volume update. The flux statistics are learned from
+training trajectories only and are stored in the checkpoint.
+
 FluxGraphNet decodes one signed transport per interior face and applies equal
 and opposite mass changes to the adjacent finite-volume cells.  It therefore
 conserves area-weighted mass by construction, including for ``state`` targets.
@@ -739,18 +745,41 @@ class FluxGraphNet(nn.Module):
         target_type: str,
         target_mean: float,
         target_std: float,
+        decode_normalized_flux: bool = False,
+        flux_mean: float = 0.0,
+        flux_std: float = 1.0,
     ) -> None:
         super().__init__()
         if num_layers < 1:
             raise ValueError("FluxGraphNet requires num_layers >= 1.")
         if target_type not in TARGET_TYPES:
             raise ValueError(f"Unsupported target_type {target_type!r}.")
+        if not isinstance(decode_normalized_flux, bool):
+            raise ValueError("decode_normalized_flux must be boolean.")
+        if not np.isfinite(flux_mean):
+            raise ValueError("flux_mean must be finite.")
+        if not np.isfinite(flux_std) or flux_std <= 0.0:
+            raise ValueError("flux_std must be finite and positive.")
         self.target_type = target_type
+        self.decode_normalized_flux = decode_normalized_flux
         self.register_buffer(
             "target_mean", torch.tensor(float(target_mean), dtype=torch.float32)
         )
         self.register_buffer(
             "target_std", torch.tensor(float(target_std), dtype=torch.float32)
+        )
+        # These buffers are reconstructed from model_kwargs and deliberately
+        # omitted from state_dict so checkpoints created before this option
+        # remain loadable without missing-buffer errors.
+        self.register_buffer(
+            "flux_mean",
+            torch.tensor(float(flux_mean), dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "flux_std",
+            torch.tensor(float(flux_std), dtype=torch.float32),
+            persistent=False,
         )
         self.node_encoder = _make_mlp(
             in_channels=in_channels,
@@ -823,7 +852,7 @@ class FluxGraphNet(nn.Module):
 
         face_features = self.face_encoder(undirected_edge_attr)
         sources, receivers = undirected_edge_index
-        face_transport = self.flux_decoder(
+        decoded_face_transport = self.flux_decoder(
             torch.cat(
                 (
                     node_features[sources],
@@ -832,6 +861,11 @@ class FluxGraphNet(nn.Module):
                 ),
                 dim=-1,
             )
+        )
+        face_transport = (
+            self.flux_mean + self.flux_std * decoded_face_transport
+            if self.decode_normalized_flux
+            else decoded_face_transport
         )
         mass_change = torch.zeros(
             (x.shape[0], 1), dtype=x.dtype, device=x.device
@@ -886,6 +920,8 @@ def build_model(
     layer_norm: bool,
     target_type: str,
     normalization: Normalization,
+    decode_normalized_flux: bool = False,
+    flux_normalization: Optional[FluxNormalization] = None,
 ) -> Tuple[nn.Module, Dict[str, object]]:
     """Construct one of the three configured architectures."""
     common: Dict[str, object] = {
@@ -900,12 +936,24 @@ def build_model(
     elif model_name == "meshgraphnet":
         kwargs = dict(common, edge_attr_channels=int(edge_attr_channels))
     elif model_name == "fluxgraphnet":
+        if decode_normalized_flux and flux_normalization is None:
+            raise ValueError(
+                "Normalized-flux decoding requires training-split flux "
+                "normalization statistics."
+            )
         kwargs = dict(
             common,
             edge_attr_channels=int(edge_attr_channels),
             target_type=target_type,
             target_mean=normalization.target_mean,
             target_std=normalization.target_std,
+            decode_normalized_flux=bool(decode_normalized_flux),
+            flux_mean=(
+                flux_normalization.mean if flux_normalization is not None else 0.0
+            ),
+            flux_std=(
+                flux_normalization.std if flux_normalization is not None else 1.0
+            ),
         )
     else:
         raise ValueError(
@@ -1405,6 +1453,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "mass conservation. FluxGraphNet is conservative by construction."
         ),
     )
+    add_boolean_argument(
+        parser,
+        "decode-normalized-flux",
+        default=False,
+        help_text=(
+            "Make FluxGraphNet decode a dimensionless standardized face value, "
+            "then transform it to physical transport with training-split flux "
+            "mean/std before applying the conservative update."
+        ),
+    )
     parser.add_argument("--learning-rate", type=float, default=1.0e-3)
     parser.add_argument("--weight-decay", type=float, default=1.0e-5)
     parser.add_argument(
@@ -1520,6 +1578,10 @@ def validate_args(args: argparse.Namespace, *, max_steps: int) -> None:
                 "At least one of node_weight_loss and flux_loss_weight must "
                 "be positive."
             )
+    elif args.decode_normalized_flux:
+        raise ValueError(
+            "decode_normalized_flux is supported only for FluxGraphNet."
+        )
     if args.gradient_clip_norm < 0.0:
         raise ValueError("gradient_clip_norm must be nonnegative.")
     if args.patience < 0 or args.num_workers < 0 or args.log_every <= 0:
@@ -1531,6 +1593,7 @@ def validate_args(args: argparse.Namespace, *, max_steps: int) -> None:
         "include_absolute_positions",
         "include_boundary_distances",
         "mass_projection",
+        "decode_normalized_flux",
     )
     invalid_booleans = [
         name for name in boolean_options if not isinstance(getattr(args, name), bool)
@@ -1567,11 +1630,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
     flux_targets = None
     flux_normalization = None
-    if flux_loss_weight > 0.0:
-        flux_targets = interface_flux_targets(data, args.target_type)
+    needs_flux_normalization = (
+        flux_loss_weight > 0.0
+        or (args.model == "fluxgraphnet" and args.decode_normalized_flux)
+    )
+    if needs_flux_normalization:
+        available_flux_targets = interface_flux_targets(data, args.target_type)
         flux_normalization = compute_flux_normalization(
-            flux_targets, split_ids["train"]
+            available_flux_targets, split_ids["train"]
         )
+        if flux_loss_weight > 0.0:
+            flux_targets = available_flux_targets
     normalization = compute_normalization(
         data,
         split_ids["train"],
@@ -1642,6 +1711,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         layer_norm=args.layer_norm,
         target_type=args.target_type,
         normalization=normalization,
+        decode_normalized_flux=args.decode_normalized_flux,
+        flux_normalization=flux_normalization,
     )
     model = model.to(device)
     optimizer = AdamW(
@@ -1677,6 +1748,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     print(f"target_type: {args.target_type}")
     print(f"autoregressive_steps: {args.autoregressive_steps}")
     print(f"mass_projection: {args.mass_projection}")
+    print(f"decode_normalized_flux: {args.decode_normalized_flux}")
     print(f"node_weight_loss: {node_weight_loss}")
     print(f"flux_loss_weight: {flux_loss_weight}")
     if args.model != "fluxgraphnet":
