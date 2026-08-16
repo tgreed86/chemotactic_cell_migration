@@ -35,11 +35,25 @@ generator; setting ``flux_loss_weight=0`` preserves node-only training. Both
 weight settings are ignored by SAGEConv and MeshGraphNet, which use the
 standard unweighted node objective.
 
+The node objective can be normalized either by the full density standard
+deviation (``node_loss_normalization=density``, the backward-compatible
+default) or in the model's normalized target space
+(``node_loss_normalization=target``). The latter matches the LWR trainer and,
+for delta prediction, measures errors relative to the standard deviation of
+one-step density changes rather than the much larger density standard
+deviation.
+
 By default, FluxGraphNet's face decoder emits transport in physical units.
 Setting ``decode_normalized_flux=true`` instead makes it emit a dimensionless
 standardized value and applies ``flux_mean + flux_std * decoded_flux`` before
 the conservative finite-volume update. The flux statistics are learned from
 training trajectories only and are stored in the checkpoint.
+
+FluxGraphNet's face decoder can use either a separately encoded static face
+attribute (``flux_decoder_edge_features=static``, the backward-compatible
+default) or the state-conditioned directed-edge latent produced by the graph
+processor (``flux_decoder_edge_features=processed``). The latter matches the
+edge-decoder path used by the LWR FluxGraphNet.
 
 FluxGraphNet decodes one signed transport per interior face and applies equal
 and opposite mass changes to the adjacent finite-volume cells.  It therefore
@@ -85,6 +99,8 @@ except ModuleNotFoundError as exc:
 
 TARGET_TYPES = ("state", "delta", "rate")
 MODEL_NAMES = ("sageconv", "meshgraphnet", "fluxgraphnet")
+NODE_LOSS_NORMALIZATIONS = ("density", "target")
+FLUX_DECODER_EDGE_FEATURES = ("static", "processed")
 
 
 @dataclass(frozen=True)
@@ -508,6 +524,15 @@ class ChemotaxisRolloutDataset(torch.utils.data.Dataset):
         self.autoregressive_steps = int(autoregressive_steps)
         self.dt = _scalar(data["dt"], "dt")
         self.num_nodes = int(self.states.shape[2])
+        self.num_directed_edges = int(self.edge_index.shape[2])
+        self.num_faces = int(self.undirected_edge_index.shape[2])
+        if self.num_directed_edges != 2 * self.num_faces:
+            raise ValueError(
+                "Expected exactly two directed edges per undirected interior face."
+            )
+        self.forward_face_edge_mask = torch.arange(
+            self.num_directed_edges
+        ) < self.num_faces
         self.starts_per_trajectory = (
             self.states.shape[1] - self.autoregressive_steps
         )
@@ -546,6 +571,7 @@ class ChemotaxisRolloutDataset(torch.utils.data.Dataset):
             undirected_edge_attr=torch.from_numpy(
                 self.undirected_edge_attr[trajectory]
             ),
+            forward_face_edge_mask=self.forward_face_edge_mask.clone(),
             cell_area=torch.from_numpy(area),
             dt_node=torch.full(
                 (self.num_nodes, 1), self.dt, dtype=torch.float32
@@ -746,6 +772,7 @@ class FluxGraphNet(nn.Module):
         target_mean: float,
         target_std: float,
         decode_normalized_flux: bool = False,
+        flux_decoder_edge_features: str = "static",
         flux_mean: float = 0.0,
         flux_std: float = 1.0,
     ) -> None:
@@ -756,12 +783,19 @@ class FluxGraphNet(nn.Module):
             raise ValueError(f"Unsupported target_type {target_type!r}.")
         if not isinstance(decode_normalized_flux, bool):
             raise ValueError("decode_normalized_flux must be boolean.")
+        if flux_decoder_edge_features not in FLUX_DECODER_EDGE_FEATURES:
+            raise ValueError(
+                "flux_decoder_edge_features must be one of "
+                f"{FLUX_DECODER_EDGE_FEATURES}; got "
+                f"{flux_decoder_edge_features!r}."
+            )
         if not np.isfinite(flux_mean):
             raise ValueError("flux_mean must be finite.")
         if not np.isfinite(flux_std) or flux_std <= 0.0:
             raise ValueError("flux_std must be finite and positive.")
         self.target_type = target_type
         self.decode_normalized_flux = decode_normalized_flux
+        self.flux_decoder_edge_features = flux_decoder_edge_features
         self.register_buffer(
             "target_mean", torch.tensor(float(target_mean), dtype=torch.float32)
         )
@@ -803,12 +837,16 @@ class FluxGraphNet(nn.Module):
             )
             for _ in range(num_layers)
         )
-        self.face_encoder = _make_mlp(
-            in_channels=edge_attr_channels,
-            hidden_channels=hidden_channels,
-            out_channels=hidden_channels,
-            dropout=dropout,
-            layer_norm=layer_norm,
+        self.face_encoder = (
+            _make_mlp(
+                in_channels=edge_attr_channels,
+                hidden_channels=hidden_channels,
+                out_channels=hidden_channels,
+                dropout=dropout,
+                layer_norm=layer_norm,
+            )
+            if flux_decoder_edge_features == "static"
+            else None
         )
         self.flux_decoder = _make_mlp(
             in_channels=3 * hidden_channels,
@@ -831,6 +869,7 @@ class FluxGraphNet(nn.Module):
         edge_attr: Tensor,
         undirected_edge_index: Tensor,
         undirected_edge_attr: Tensor,
+        forward_face_edge_mask: Optional[Tensor] = None,
         cell_area: Tensor,
         current: Tensor,
         **_: Tensor,
@@ -850,8 +889,29 @@ class FluxGraphNet(nn.Module):
                 node_features, edge_features, edge_index
             )
 
-        face_features = self.face_encoder(undirected_edge_attr)
+        if self.flux_decoder_edge_features == "processed":
+            if forward_face_edge_mask is None:
+                raise ValueError(
+                    "Processed flux-decoder edge features require "
+                    "forward_face_edge_mask."
+                )
+            if forward_face_edge_mask.dtype != torch.bool:
+                raise ValueError("forward_face_edge_mask must have boolean dtype.")
+            if forward_face_edge_mask.shape != (edge_features.shape[0],):
+                raise ValueError(
+                    "forward_face_edge_mask must have shape [directed_edge]."
+                )
+            face_features = edge_features[forward_face_edge_mask]
+        else:
+            if self.face_encoder is None:
+                raise RuntimeError("Static face encoder is unavailable.")
+            face_features = self.face_encoder(undirected_edge_attr)
         sources, receivers = undirected_edge_index
+        if face_features.shape[0] != sources.shape[0]:
+            raise ValueError(
+                "The selected face features do not align with undirected faces: "
+                f"{face_features.shape[0]} features for {sources.shape[0]} faces."
+            )
         decoded_face_transport = self.flux_decoder(
             torch.cat(
                 (
@@ -885,6 +945,7 @@ class FluxGraphNet(nn.Module):
         edge_attr: Tensor,
         undirected_edge_index: Tensor,
         undirected_edge_attr: Tensor,
+        forward_face_edge_mask: Optional[Tensor] = None,
         cell_area: Tensor,
         current: Tensor,
         **kwargs: Tensor,
@@ -895,6 +956,7 @@ class FluxGraphNet(nn.Module):
             edge_attr=edge_attr,
             undirected_edge_index=undirected_edge_index,
             undirected_edge_attr=undirected_edge_attr,
+            forward_face_edge_mask=forward_face_edge_mask,
             cell_area=cell_area,
             current=current,
             **kwargs,
@@ -921,6 +983,7 @@ def build_model(
     target_type: str,
     normalization: Normalization,
     decode_normalized_flux: bool = False,
+    flux_decoder_edge_features: str = "static",
     flux_normalization: Optional[FluxNormalization] = None,
 ) -> Tuple[nn.Module, Dict[str, object]]:
     """Construct one of the three configured architectures."""
@@ -948,6 +1011,7 @@ def build_model(
             target_mean=normalization.target_mean,
             target_std=normalization.target_std,
             decode_normalized_flux=bool(decode_normalized_flux),
+            flux_decoder_edge_features=str(flux_decoder_edge_features),
             flux_mean=(
                 flux_normalization.mean if flux_normalization is not None else 0.0
             ),
@@ -1029,6 +1093,7 @@ def predict_normalized_target(
         edge_attr=batch.edge_attr,
         undirected_edge_index=batch.undirected_edge_index,
         undirected_edge_attr=batch.undirected_edge_attr,
+        forward_face_edge_mask=getattr(batch, "forward_face_edge_mask", None),
         cell_area=batch.cell_area,
         current=current,
     )
@@ -1046,6 +1111,7 @@ def predict_normalized_target_and_flux(
         edge_attr=batch.edge_attr,
         undirected_edge_index=batch.undirected_edge_index,
         undirected_edge_attr=batch.undirected_edge_attr,
+        forward_face_edge_mask=getattr(batch, "forward_face_edge_mask", None),
         cell_area=batch.cell_area,
         current=current,
     )
@@ -1057,6 +1123,7 @@ def autoregressive_batch(
     *,
     normalization: Normalization,
     target_type: str,
+    node_loss_normalization: str,
     autoregressive_steps: int,
     mass_projection: bool,
     node_weight_loss: float,
@@ -1064,6 +1131,11 @@ def autoregressive_batch(
     flux_normalization: Optional[FluxNormalization],
 ) -> Tuple[Tensor, Dict[str, float]]:
     """Unroll a batch and return differentiable loss plus detached metrics."""
+    if node_loss_normalization not in NODE_LOSS_NORMALIZATIONS:
+        raise ValueError(
+            "node_loss_normalization must be one of "
+            f"{NODE_LOSS_NORMALIZATIONS}; got {node_loss_normalization!r}."
+        )
     if batch.rollout.shape[1] != autoregressive_steps + 1:
         raise ValueError("Batch rollout width does not match autoregressive_steps.")
     current = batch.rollout[:, 0]
@@ -1119,13 +1191,26 @@ def autoregressive_batch(
             raw_target, current, target_type, batch.dt_node
         )
         true_next = batch.rollout[:, step + 1]
-        normalized_state_error = (
-            predicted_next - true_next
-        ) / normalization.density_std
+        if node_loss_normalization == "density":
+            normalized_node_error = (
+                predicted_next - true_next
+            ) / normalization.density_std
+        else:
+            if target_type == "state":
+                required_raw_target = true_next
+            else:
+                required_raw_target = true_next - current
+                if target_type == "rate":
+                    required_raw_target = required_raw_target / batch.dt_node
+            required_normalized_target = (
+                required_raw_target - normalization.target_mean
+            ) / normalization.target_std
+            normalized_node_error = prediction - required_normalized_target
         # A state-space rollout loss gives state/delta/rate parameterizations
-        # the same physical objective and trains accumulated multi-step error
-        # directly. Target normalization still controls the decoder scale.
-        node_loss = torch.mean(normalized_state_error.square())
+        # the same physical objective and trains accumulated multi-step error.
+        # Target-space normalization instead matches the LWR trainer and makes
+        # typical one-step target errors order one.
+        node_loss = torch.mean(normalized_node_error.square())
         flux_loss = current.new_zeros(())
         if flux_loss_weight > 0.0:
             if predicted_flux is None or flux_normalization is None:
@@ -1148,7 +1233,7 @@ def autoregressive_batch(
         total_loss = total_loss + step_loss / autoregressive_steps
 
         with torch.no_grad():
-            normalized_sse += float(torch.sum(normalized_state_error.square()))
+            normalized_sse += float(torch.sum(normalized_node_error.square()))
             next_sse += float(F.mse_loss(
                 predicted_next, true_next, reduction="sum"
             ))
@@ -1187,6 +1272,7 @@ def train_epoch(
     device: torch.device,
     normalization: Normalization,
     target_type: str,
+    node_loss_normalization: str,
     autoregressive_steps: int,
     mass_projection: bool,
     gradient_clip_norm: float,
@@ -1211,6 +1297,7 @@ def train_epoch(
             batch,
             normalization=normalization,
             target_type=target_type,
+            node_loss_normalization=node_loss_normalization,
             autoregressive_steps=autoregressive_steps,
             mass_projection=mass_projection,
             node_weight_loss=node_weight_loss,
@@ -1256,6 +1343,7 @@ def evaluate(
     device: torch.device,
     normalization: Normalization,
     target_type: str,
+    node_loss_normalization: str,
     autoregressive_steps: int,
     mass_projection: bool,
     node_weight_loss: float,
@@ -1278,6 +1366,7 @@ def evaluate(
             batch,
             normalization=normalization,
             target_type=target_type,
+            node_loss_normalization=node_loss_normalization,
             autoregressive_steps=autoregressive_steps,
             mass_projection=mass_projection,
             node_weight_loss=node_weight_loss,
@@ -1392,6 +1481,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", choices=MODEL_NAMES, default="sageconv")
     parser.add_argument("--target-type", choices=TARGET_TYPES, default="delta")
     parser.add_argument(
+        "--node-loss-normalization",
+        choices=NODE_LOSS_NORMALIZATIONS,
+        default="density",
+        help=(
+            "Normalize node errors by the full density standard deviation "
+            "('density', backward-compatible) or compute MSE directly in "
+            "normalized state/delta/rate target space ('target', matching "
+            "the LWR trainer)."
+        ),
+    )
+    parser.add_argument(
         "--autoregressive-steps",
         type=int,
         default=1,
@@ -1463,6 +1563,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "mean/std before applying the conservative update."
         ),
     )
+    parser.add_argument(
+        "--flux-decoder-edge-features",
+        choices=FLUX_DECODER_EDGE_FEATURES,
+        default="static",
+        help=(
+            "Use a separately encoded static face attribute ('static', "
+            "backward-compatible) or the state-conditioned processed forward "
+            "directed-edge latent ('processed') in FluxGraphNet's face decoder."
+        ),
+    )
     parser.add_argument("--learning-rate", type=float, default=1.0e-3)
     parser.add_argument("--weight-decay", type=float, default=1.0e-5)
     parser.add_argument(
@@ -1470,8 +1580,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help=(
-            "FluxGraphNet-only weight applied to normalized node-state "
-            "rollout MSE; ignored for other architectures."
+            "FluxGraphNet-only weight applied to the selected normalized node "
+            "objective; ignored for other architectures."
         ),
     )
     parser.add_argument(
@@ -1564,6 +1674,17 @@ def validate_args(args: argparse.Namespace, *, max_steps: int) -> None:
         raise ValueError(
             f"autoregressive_steps must be in [1, {max_steps}]."
         )
+    if args.node_loss_normalization not in NODE_LOSS_NORMALIZATIONS:
+        raise ValueError(
+            "node_loss_normalization must be one of "
+            f"{NODE_LOSS_NORMALIZATIONS}; got {args.node_loss_normalization!r}."
+        )
+    if args.flux_decoder_edge_features not in FLUX_DECODER_EDGE_FEATURES:
+        raise ValueError(
+            "flux_decoder_edge_features must be one of "
+            f"{FLUX_DECODER_EDGE_FEATURES}; got "
+            f"{args.flux_decoder_edge_features!r}."
+        )
     if not (0.0 <= args.dropout < 1.0):
         raise ValueError("dropout must be in [0, 1).")
     if args.learning_rate <= 0.0 or args.weight_decay < 0.0:
@@ -1578,10 +1699,16 @@ def validate_args(args: argparse.Namespace, *, max_steps: int) -> None:
                 "At least one of node_weight_loss and flux_loss_weight must "
                 "be positive."
             )
-    elif args.decode_normalized_flux:
-        raise ValueError(
-            "decode_normalized_flux is supported only for FluxGraphNet."
-        )
+    else:
+        if args.decode_normalized_flux:
+            raise ValueError(
+                "decode_normalized_flux is supported only for FluxGraphNet."
+            )
+        if args.flux_decoder_edge_features != "static":
+            raise ValueError(
+                "flux_decoder_edge_features='processed' is supported only for "
+                "FluxGraphNet."
+            )
     if args.gradient_clip_norm < 0.0:
         raise ValueError("gradient_clip_norm must be nonnegative.")
     if args.patience < 0 or args.num_workers < 0 or args.log_every <= 0:
@@ -1712,6 +1839,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         target_type=args.target_type,
         normalization=normalization,
         decode_normalized_flux=args.decode_normalized_flux,
+        flux_decoder_edge_features=args.flux_decoder_edge_features,
         flux_normalization=flux_normalization,
     )
     model = model.to(device)
@@ -1746,9 +1874,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     print(f"device: {device}")
     print(f"model: {args.model} ({type(model).__name__})")
     print(f"target_type: {args.target_type}")
+    print(f"node_loss_normalization: {args.node_loss_normalization}")
     print(f"autoregressive_steps: {args.autoregressive_steps}")
     print(f"mass_projection: {args.mass_projection}")
     print(f"decode_normalized_flux: {args.decode_normalized_flux}")
+    print(f"flux_decoder_edge_features: {args.flux_decoder_edge_features}")
     print(f"node_weight_loss: {node_weight_loss}")
     print(f"flux_loss_weight: {flux_loss_weight}")
     if args.model != "fluxgraphnet":
@@ -1793,6 +1923,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             device=device,
             normalization=normalization,
             target_type=args.target_type,
+            node_loss_normalization=args.node_loss_normalization,
             autoregressive_steps=args.autoregressive_steps,
             mass_projection=args.mass_projection,
             gradient_clip_norm=args.gradient_clip_norm,
@@ -1806,6 +1937,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             device=device,
             normalization=normalization,
             target_type=args.target_type,
+            node_loss_normalization=args.node_loss_normalization,
             autoregressive_steps=args.autoregressive_steps,
             mass_projection=args.mass_projection,
             node_weight_loss=node_weight_loss,
@@ -1859,6 +1991,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         device=device,
         normalization=normalization,
         target_type=args.target_type,
+        node_loss_normalization=args.node_loss_normalization,
         autoregressive_steps=args.autoregressive_steps,
         mass_projection=args.mass_projection,
         node_weight_loss=node_weight_loss,
@@ -1883,6 +2016,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         },
         "edge_attr_columns": str(data.get("edge_attr_columns", "")),
         "target_type": args.target_type,
+        "node_loss_normalization": args.node_loss_normalization,
+        "flux_decoder_edge_features": args.flux_decoder_edge_features,
         "autoregressive_steps": args.autoregressive_steps,
         "mass_projection": args.mass_projection,
         "node_weight_loss": node_weight_loss,
