@@ -35,6 +35,13 @@ generator; setting ``flux_loss_weight=0`` preserves node-only training. Both
 weight settings are ignored by SAGEConv and MeshGraphNet, which use the
 standard unweighted node objective.
 
+During multi-step training, direct flux supervision can be applied at every
+unrolled transition (``flux_supervision_steps=all``, the backward-compatible
+default) or only at the first transition of each rollout window
+(``flux_supervision_steps=first``). In either mode, the node objective still
+covers every autoregressive step and the configured flux weight is not diluted
+by the rollout length.
+
 The node objective can be normalized either by the full density standard
 deviation (``node_loss_normalization=density``, the backward-compatible
 default) or in the model's normalized target space
@@ -101,6 +108,7 @@ TARGET_TYPES = ("state", "delta", "rate")
 MODEL_NAMES = ("sageconv", "meshgraphnet", "fluxgraphnet")
 NODE_LOSS_NORMALIZATIONS = ("density", "target")
 FLUX_DECODER_EDGE_FEATURES = ("static", "processed")
+FLUX_SUPERVISION_STEPS = ("all", "first")
 
 
 @dataclass(frozen=True)
@@ -1128,6 +1136,7 @@ def autoregressive_batch(
     mass_projection: bool,
     node_weight_loss: float,
     flux_loss_weight: float,
+    flux_supervision_steps: str,
     flux_normalization: Optional[FluxNormalization],
 ) -> Tuple[Tensor, Dict[str, float]]:
     """Unroll a batch and return differentiable loss plus detached metrics."""
@@ -1136,10 +1145,16 @@ def autoregressive_batch(
             "node_loss_normalization must be one of "
             f"{NODE_LOSS_NORMALIZATIONS}; got {node_loss_normalization!r}."
         )
+    if flux_supervision_steps not in FLUX_SUPERVISION_STEPS:
+        raise ValueError(
+            "flux_supervision_steps must be one of "
+            f"{FLUX_SUPERVISION_STEPS}; got {flux_supervision_steps!r}."
+        )
     if batch.rollout.shape[1] != autoregressive_steps + 1:
         raise ValueError("Batch rollout width does not match autoregressive_steps.")
     current = batch.rollout[:, 0]
-    total_loss = current.new_zeros(())
+    total_node_loss = current.new_zeros(())
+    total_flux_loss = current.new_zeros(())
     normalized_sse = 0.0
     flux_normalized_sse = 0.0
     next_sse = 0.0
@@ -1154,6 +1169,9 @@ def autoregressive_batch(
             raise ValueError("Flux supervision requires flux normalization.")
         if not hasattr(batch, "flux_target"):
             raise ValueError("Flux-supervised batch has no flux_target.")
+    supervised_flux_steps = (
+        1 if flux_supervision_steps == "first" else autoregressive_steps
+    )
 
     for step in range(autoregressive_steps):
         normalized_density = (
@@ -1163,7 +1181,10 @@ def autoregressive_batch(
             (normalized_density, batch.static_node_features), dim=-1
         )
         predicted_flux = None
-        if flux_loss_weight > 0.0:
+        supervise_flux = flux_loss_weight > 0.0 and (
+            flux_supervision_steps == "all" or step == 0
+        )
+        if supervise_flux:
             prediction, predicted_flux = predict_normalized_target_and_flux(
                 model, batch, node_input, current
             )
@@ -1211,8 +1232,9 @@ def autoregressive_batch(
         # Target-space normalization instead matches the LWR trainer and makes
         # typical one-step target errors order one.
         node_loss = torch.mean(normalized_node_error.square())
+        total_node_loss = total_node_loss + node_loss / autoregressive_steps
         flux_loss = current.new_zeros(())
-        if flux_loss_weight > 0.0:
+        if supervise_flux:
             if predicted_flux is None or flux_normalization is None:
                 raise RuntimeError("Flux prediction or normalization is unavailable.")
             target_flux = batch.flux_target[:, step]
@@ -1229,8 +1251,9 @@ def autoregressive_batch(
                 torch.sum(normalized_flux_error.detach().square())
             )
             flux_value_count += target_flux.numel()
-        step_loss = node_weight_loss * node_loss + flux_loss_weight * flux_loss
-        total_loss = total_loss + step_loss / autoregressive_steps
+            total_flux_loss = (
+                total_flux_loss + flux_loss / supervised_flux_steps
+            )
 
         with torch.no_grad():
             normalized_sse += float(torch.sum(normalized_node_error.square()))
@@ -1261,6 +1284,9 @@ def autoregressive_batch(
         "next_state_rmse": float(np.sqrt(next_sse / max(value_count, 1))),
         "mass_mae": mass_absolute_error / max(graph_step_count, 1),
     }
+    total_loss = (
+        node_weight_loss * total_node_loss + flux_loss_weight * total_flux_loss
+    )
     return total_loss, metrics
 
 
@@ -1278,6 +1304,7 @@ def train_epoch(
     gradient_clip_norm: float,
     node_weight_loss: float,
     flux_loss_weight: float,
+    flux_supervision_steps: str,
     flux_normalization: Optional[FluxNormalization],
 ) -> Dict[str, float]:
     model.train()
@@ -1302,6 +1329,7 @@ def train_epoch(
             mass_projection=mass_projection,
             node_weight_loss=node_weight_loss,
             flux_loss_weight=flux_loss_weight,
+            flux_supervision_steps=flux_supervision_steps,
             flux_normalization=flux_normalization,
         )
         loss.backward()
@@ -1348,6 +1376,7 @@ def evaluate(
     mass_projection: bool,
     node_weight_loss: float,
     flux_loss_weight: float,
+    flux_supervision_steps: str,
     flux_normalization: Optional[FluxNormalization],
 ) -> Dict[str, float]:
     model.eval()
@@ -1371,6 +1400,7 @@ def evaluate(
             mass_projection=mass_projection,
             node_weight_loss=node_weight_loss,
             flux_loss_weight=flux_loss_weight,
+            flux_supervision_steps=flux_supervision_steps,
             flux_normalization=flux_normalization,
         )
         weight = int(batch.num_graphs) * autoregressive_steps
@@ -1595,6 +1625,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--flux-supervision-steps",
+        choices=FLUX_SUPERVISION_STEPS,
+        default="all",
+        help=(
+            "Apply direct FluxGraphNet flux supervision at every unrolled "
+            "transition ('all', backward-compatible) or only at step zero "
+            "of each rollout window ('first'). The node rollout loss still "
+            "uses every step."
+        ),
+    )
+    parser.add_argument(
         "--gradient-clip-norm",
         type=float,
         default=1.0,
@@ -1685,6 +1726,11 @@ def validate_args(args: argparse.Namespace, *, max_steps: int) -> None:
             f"{FLUX_DECODER_EDGE_FEATURES}; got "
             f"{args.flux_decoder_edge_features!r}."
         )
+    if args.flux_supervision_steps not in FLUX_SUPERVISION_STEPS:
+        raise ValueError(
+            "flux_supervision_steps must be one of "
+            f"{FLUX_SUPERVISION_STEPS}; got {args.flux_supervision_steps!r}."
+        )
     if not (0.0 <= args.dropout < 1.0):
         raise ValueError("dropout must be in [0, 1).")
     if args.learning_rate <= 0.0 or args.weight_decay < 0.0:
@@ -1707,6 +1753,11 @@ def validate_args(args: argparse.Namespace, *, max_steps: int) -> None:
         if args.flux_decoder_edge_features != "static":
             raise ValueError(
                 "flux_decoder_edge_features='processed' is supported only for "
+                "FluxGraphNet."
+            )
+        if args.flux_supervision_steps != "all":
+            raise ValueError(
+                "flux_supervision_steps='first' is supported only for "
                 "FluxGraphNet."
             )
     if args.gradient_clip_norm < 0.0:
@@ -1881,6 +1932,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     print(f"flux_decoder_edge_features: {args.flux_decoder_edge_features}")
     print(f"node_weight_loss: {node_weight_loss}")
     print(f"flux_loss_weight: {flux_loss_weight}")
+    print(f"flux_supervision_steps: {args.flux_supervision_steps}")
     if args.model != "fluxgraphnet":
         print(
             "loss-weight config: ignored for this architecture; using the "
@@ -1929,6 +1981,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             gradient_clip_norm=args.gradient_clip_norm,
             node_weight_loss=node_weight_loss,
             flux_loss_weight=flux_loss_weight,
+            flux_supervision_steps=args.flux_supervision_steps,
             flux_normalization=flux_normalization,
         )
         validation_metrics = evaluate(
@@ -1942,6 +1995,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             mass_projection=args.mass_projection,
             node_weight_loss=node_weight_loss,
             flux_loss_weight=flux_loss_weight,
+            flux_supervision_steps=args.flux_supervision_steps,
             flux_normalization=flux_normalization,
         )
         entry: Dict[str, float] = {"epoch": float(epoch)}
@@ -1996,6 +2050,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         mass_projection=args.mass_projection,
         node_weight_loss=node_weight_loss,
         flux_loss_weight=flux_loss_weight,
+        flux_supervision_steps=args.flux_supervision_steps,
         flux_normalization=flux_normalization,
     )
 
@@ -2022,6 +2077,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "mass_projection": args.mass_projection,
         "node_weight_loss": node_weight_loss,
         "flux_loss_weight": flux_loss_weight,
+        "flux_supervision_steps": args.flux_supervision_steps,
         "flux_normalization": (
             asdict(flux_normalization) if flux_normalization is not None else None
         ),
