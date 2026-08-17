@@ -50,6 +50,13 @@ for delta prediction, measures errors relative to the standard deviation of
 one-step density changes rather than the much larger density standard
 deviation.
 
+The node MSE normally gives every cell equal weight. Setting
+``node_density_weighting=target`` instead linearly upweights cells whose true
+next-state density exceeds the training density mean. The excess is measured
+in training density standard deviations and scaled by
+``node_density_weight_strength``; weights are normalized to mean one at each
+rollout step so the overall node-loss scale remains comparable.
+
 By default, FluxGraphNet's face decoder emits transport in physical units.
 Setting ``decode_normalized_flux=true`` instead makes it emit a dimensionless
 standardized value and applies ``flux_mean + flux_std * decoded_flux`` before
@@ -60,7 +67,10 @@ FluxGraphNet's face decoder can use either a separately encoded static face
 attribute (``flux_decoder_edge_features=static``, the backward-compatible
 default) or the state-conditioned directed-edge latent produced by the graph
 processor (``flux_decoder_edge_features=processed``). The latter matches the
-edge-decoder path used by the LWR FluxGraphNet.
+edge-decoder path used by the LWR FluxGraphNet. With processed edges,
+``antisymmetric_flux_decoder=true`` evaluates the shared decoder in both face
+directions and takes half their difference, guaranteeing that reversing the
+stored face orientation reverses the physical flux.
 
 FluxGraphNet decodes one signed transport per interior face and applies equal
 and opposite mass changes to the adjacent finite-volume cells.  It therefore
@@ -107,6 +117,7 @@ except ModuleNotFoundError as exc:
 TARGET_TYPES = ("state", "delta", "rate")
 MODEL_NAMES = ("sageconv", "meshgraphnet", "fluxgraphnet")
 NODE_LOSS_NORMALIZATIONS = ("density", "target")
+NODE_DENSITY_WEIGHTINGS = ("none", "target")
 FLUX_DECODER_EDGE_FEATURES = ("static", "processed")
 FLUX_SUPERVISION_STEPS = ("all", "first")
 
@@ -781,6 +792,7 @@ class FluxGraphNet(nn.Module):
         target_std: float,
         decode_normalized_flux: bool = False,
         flux_decoder_edge_features: str = "static",
+        antisymmetric_flux_decoder: bool = False,
         flux_mean: float = 0.0,
         flux_std: float = 1.0,
     ) -> None:
@@ -791,11 +803,21 @@ class FluxGraphNet(nn.Module):
             raise ValueError(f"Unsupported target_type {target_type!r}.")
         if not isinstance(decode_normalized_flux, bool):
             raise ValueError("decode_normalized_flux must be boolean.")
+        if not isinstance(antisymmetric_flux_decoder, bool):
+            raise ValueError("antisymmetric_flux_decoder must be boolean.")
         if flux_decoder_edge_features not in FLUX_DECODER_EDGE_FEATURES:
             raise ValueError(
                 "flux_decoder_edge_features must be one of "
                 f"{FLUX_DECODER_EDGE_FEATURES}; got "
                 f"{flux_decoder_edge_features!r}."
+            )
+        if (
+            antisymmetric_flux_decoder
+            and flux_decoder_edge_features != "processed"
+        ):
+            raise ValueError(
+                "antisymmetric_flux_decoder requires "
+                "flux_decoder_edge_features='processed'."
             )
         if not np.isfinite(flux_mean):
             raise ValueError("flux_mean must be finite.")
@@ -804,6 +826,7 @@ class FluxGraphNet(nn.Module):
         self.target_type = target_type
         self.decode_normalized_flux = decode_normalized_flux
         self.flux_decoder_edge_features = flux_decoder_edge_features
+        self.antisymmetric_flux_decoder = antisymmetric_flux_decoder
         self.register_buffer(
             "target_mean", torch.tensor(float(target_mean), dtype=torch.float32)
         )
@@ -897,6 +920,7 @@ class FluxGraphNet(nn.Module):
                 node_features, edge_features, edge_index
             )
 
+        reverse_face_features = None
         if self.flux_decoder_edge_features == "processed":
             if forward_face_edge_mask is None:
                 raise ValueError(
@@ -910,6 +934,8 @@ class FluxGraphNet(nn.Module):
                     "forward_face_edge_mask must have shape [directed_edge]."
                 )
             face_features = edge_features[forward_face_edge_mask]
+            if self.antisymmetric_flux_decoder:
+                reverse_face_features = edge_features[~forward_face_edge_mask]
         else:
             if self.face_encoder is None:
                 raise RuntimeError("Static face encoder is unavailable.")
@@ -920,21 +946,51 @@ class FluxGraphNet(nn.Module):
                 "The selected face features do not align with undirected faces: "
                 f"{face_features.shape[0]} features for {sources.shape[0]} faces."
             )
-        decoded_face_transport = self.flux_decoder(
-            torch.cat(
+        forward_decoder_input = torch.cat(
+            (
+                node_features[sources],
+                node_features[receivers],
+                face_features,
+            ),
+            dim=-1,
+        )
+        if self.antisymmetric_flux_decoder:
+            if reverse_face_features is None:
+                raise RuntimeError("Reverse processed-edge features are unavailable.")
+            if reverse_face_features.shape != face_features.shape:
+                raise ValueError(
+                    "Forward and reverse processed-edge features must align."
+                )
+            reverse_decoder_input = torch.cat(
                 (
-                    node_features[sources],
                     node_features[receivers],
-                    face_features,
+                    node_features[sources],
+                    reverse_face_features,
                 ),
                 dim=-1,
             )
-        )
-        face_transport = (
-            self.flux_mean + self.flux_std * decoded_face_transport
-            if self.decode_normalized_flux
-            else decoded_face_transport
-        )
+            decoded_directions = self.flux_decoder(
+                torch.cat((forward_decoder_input, reverse_decoder_input), dim=0)
+            )
+            num_faces = sources.shape[0]
+            decoded_forward = decoded_directions[:num_faces]
+            decoded_reverse = decoded_directions[num_faces:]
+            if self.decode_normalized_flux:
+                physical_forward = self.flux_mean + self.flux_std * decoded_forward
+                physical_reverse = self.flux_mean + self.flux_std * decoded_reverse
+            else:
+                physical_forward = decoded_forward
+                physical_reverse = decoded_reverse
+            # Antisymmetrize in physical units. In normalized-flux mode this
+            # also cancels the orientation-independent fitted flux mean.
+            face_transport = 0.5 * (physical_forward - physical_reverse)
+        else:
+            decoded_face_transport = self.flux_decoder(forward_decoder_input)
+            face_transport = (
+                self.flux_mean + self.flux_std * decoded_face_transport
+                if self.decode_normalized_flux
+                else decoded_face_transport
+            )
         mass_change = torch.zeros(
             (x.shape[0], 1), dtype=x.dtype, device=x.device
         )
@@ -992,6 +1048,7 @@ def build_model(
     normalization: Normalization,
     decode_normalized_flux: bool = False,
     flux_decoder_edge_features: str = "static",
+    antisymmetric_flux_decoder: bool = False,
     flux_normalization: Optional[FluxNormalization] = None,
 ) -> Tuple[nn.Module, Dict[str, object]]:
     """Construct one of the three configured architectures."""
@@ -1020,6 +1077,7 @@ def build_model(
             target_std=normalization.target_std,
             decode_normalized_flux=bool(decode_normalized_flux),
             flux_decoder_edge_features=str(flux_decoder_edge_features),
+            antisymmetric_flux_decoder=bool(antisymmetric_flux_decoder),
             flux_mean=(
                 flux_normalization.mean if flux_normalization is not None else 0.0
             ),
@@ -1125,6 +1183,33 @@ def predict_normalized_target_and_flux(
     )
 
 
+def node_density_weights(
+    true_density: Tensor,
+    *,
+    normalization: Normalization,
+    mode: str,
+    strength: float,
+) -> Tensor:
+    """Return mean-one target-density weights for the node objective."""
+    if mode not in NODE_DENSITY_WEIGHTINGS:
+        raise ValueError(
+            "node_density_weighting must be one of "
+            f"{NODE_DENSITY_WEIGHTINGS}; got {mode!r}."
+        )
+    if not np.isfinite(strength) or strength < 0.0:
+        raise ValueError(
+            "node_density_weight_strength must be finite and nonnegative."
+        )
+    if mode == "none" or strength == 0.0:
+        return torch.ones_like(true_density)
+    standardized_excess = torch.clamp_min(
+        (true_density - normalization.density_mean) / normalization.density_std,
+        0.0,
+    )
+    raw_weights = 1.0 + strength * standardized_excess
+    return raw_weights / raw_weights.mean().clamp_min(1.0e-12)
+
+
 def autoregressive_batch(
     model: nn.Module,
     batch: Data,
@@ -1132,6 +1217,8 @@ def autoregressive_batch(
     normalization: Normalization,
     target_type: str,
     node_loss_normalization: str,
+    node_density_weighting: str,
+    node_density_weight_strength: float,
     autoregressive_steps: int,
     mass_projection: bool,
     node_weight_loss: float,
@@ -1145,6 +1232,18 @@ def autoregressive_batch(
             "node_loss_normalization must be one of "
             f"{NODE_LOSS_NORMALIZATIONS}; got {node_loss_normalization!r}."
         )
+    if node_density_weighting not in NODE_DENSITY_WEIGHTINGS:
+        raise ValueError(
+            "node_density_weighting must be one of "
+            f"{NODE_DENSITY_WEIGHTINGS}; got {node_density_weighting!r}."
+        )
+    if (
+        not np.isfinite(node_density_weight_strength)
+        or node_density_weight_strength < 0.0
+    ):
+        raise ValueError(
+            "node_density_weight_strength must be finite and nonnegative."
+        )
     if flux_supervision_steps not in FLUX_SUPERVISION_STEPS:
         raise ValueError(
             "flux_supervision_steps must be one of "
@@ -1156,6 +1255,7 @@ def autoregressive_batch(
     total_node_loss = current.new_zeros(())
     total_flux_loss = current.new_zeros(())
     normalized_sse = 0.0
+    objective_node_sse = 0.0
     flux_normalized_sse = 0.0
     next_sse = 0.0
     mass_absolute_error = 0.0
@@ -1231,7 +1331,13 @@ def autoregressive_batch(
         # the same physical objective and trains accumulated multi-step error.
         # Target-space normalization instead matches the LWR trainer and makes
         # typical one-step target errors order one.
-        node_loss = torch.mean(normalized_node_error.square())
+        density_weights = node_density_weights(
+            true_next,
+            normalization=normalization,
+            mode=node_density_weighting,
+            strength=node_density_weight_strength,
+        )
+        node_loss = torch.mean(density_weights * normalized_node_error.square())
         total_node_loss = total_node_loss + node_loss / autoregressive_steps
         flux_loss = current.new_zeros(())
         if supervise_flux:
@@ -1257,6 +1363,7 @@ def autoregressive_batch(
 
         with torch.no_grad():
             normalized_sse += float(torch.sum(normalized_node_error.square()))
+            objective_node_sse += float(node_loss) * true_next.numel()
             next_sse += float(F.mse_loss(
                 predicted_next, true_next, reduction="sum"
             ))
@@ -1271,14 +1378,16 @@ def autoregressive_batch(
         current = predicted_next
 
     node_normalized_mse = normalized_sse / max(value_count, 1)
+    objective_node_mse = objective_node_sse / max(value_count, 1)
     flux_normalized_mse = (
         flux_normalized_sse / flux_value_count if flux_value_count > 0 else 0.0
     )
     metrics = {
         "normalized_mse": node_normalized_mse,
+        "objective_node_mse": objective_node_mse,
         "flux_normalized_mse": flux_normalized_mse,
         "weighted_total_loss": (
-            node_weight_loss * node_normalized_mse
+            node_weight_loss * objective_node_mse
             + flux_loss_weight * flux_normalized_mse
         ),
         "next_state_rmse": float(np.sqrt(next_sse / max(value_count, 1))),
@@ -1299,6 +1408,8 @@ def train_epoch(
     normalization: Normalization,
     target_type: str,
     node_loss_normalization: str,
+    node_density_weighting: str,
+    node_density_weight_strength: float,
     autoregressive_steps: int,
     mass_projection: bool,
     gradient_clip_norm: float,
@@ -1310,6 +1421,7 @@ def train_epoch(
     model.train()
     weighted_metrics = {
         "normalized_mse": 0.0,
+        "objective_node_mse": 0.0,
         "flux_normalized_mse": 0.0,
         "weighted_total_loss": 0.0,
         "next_state_rmse_squared": 0.0,
@@ -1325,6 +1437,8 @@ def train_epoch(
             normalization=normalization,
             target_type=target_type,
             node_loss_normalization=node_loss_normalization,
+            node_density_weighting=node_density_weighting,
+            node_density_weight_strength=node_density_weight_strength,
             autoregressive_steps=autoregressive_steps,
             mass_projection=mass_projection,
             node_weight_loss=node_weight_loss,
@@ -1339,6 +1453,9 @@ def train_epoch(
         weight = int(batch.num_graphs) * autoregressive_steps
         graph_steps += weight
         weighted_metrics["normalized_mse"] += metrics["normalized_mse"] * weight
+        weighted_metrics["objective_node_mse"] += (
+            metrics["objective_node_mse"] * weight
+        )
         weighted_metrics["flux_normalized_mse"] += (
             metrics["flux_normalized_mse"] * weight
         )
@@ -1352,6 +1469,7 @@ def train_epoch(
     divisor = max(graph_steps, 1)
     return {
         "normalized_mse": weighted_metrics["normalized_mse"] / divisor,
+        "objective_node_mse": weighted_metrics["objective_node_mse"] / divisor,
         "flux_normalized_mse": (
             weighted_metrics["flux_normalized_mse"] / divisor
         ),
@@ -1372,6 +1490,8 @@ def evaluate(
     normalization: Normalization,
     target_type: str,
     node_loss_normalization: str,
+    node_density_weighting: str,
+    node_density_weight_strength: float,
     autoregressive_steps: int,
     mass_projection: bool,
     node_weight_loss: float,
@@ -1382,6 +1502,7 @@ def evaluate(
     model.eval()
     accumulated = {
         "normalized_mse": 0.0,
+        "objective_node_mse": 0.0,
         "flux_normalized_mse": 0.0,
         "weighted_total_loss": 0.0,
         "next_state_rmse_squared": 0.0,
@@ -1396,6 +1517,8 @@ def evaluate(
             normalization=normalization,
             target_type=target_type,
             node_loss_normalization=node_loss_normalization,
+            node_density_weighting=node_density_weighting,
+            node_density_weight_strength=node_density_weight_strength,
             autoregressive_steps=autoregressive_steps,
             mass_projection=mass_projection,
             node_weight_loss=node_weight_loss,
@@ -1406,6 +1529,9 @@ def evaluate(
         weight = int(batch.num_graphs) * autoregressive_steps
         graph_steps += weight
         accumulated["normalized_mse"] += metrics["normalized_mse"] * weight
+        accumulated["objective_node_mse"] += (
+            metrics["objective_node_mse"] * weight
+        )
         accumulated["flux_normalized_mse"] += (
             metrics["flux_normalized_mse"] * weight
         )
@@ -1419,6 +1545,7 @@ def evaluate(
     divisor = max(graph_steps, 1)
     return {
         "normalized_mse": accumulated["normalized_mse"] / divisor,
+        "objective_node_mse": accumulated["objective_node_mse"] / divisor,
         "flux_normalized_mse": accumulated["flux_normalized_mse"] / divisor,
         "weighted_total_loss": accumulated["weighted_total_loss"] / divisor,
         "next_state_rmse": float(
@@ -1522,6 +1649,26 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--node-density-weighting",
+        choices=NODE_DENSITY_WEIGHTINGS,
+        default="none",
+        help=(
+            "Use equal cell weights ('none', backward-compatible) or linearly "
+            "upweight cells according to standardized excess true next-state "
+            "density ('target')."
+        ),
+    )
+    parser.add_argument(
+        "--node-density-weight-strength",
+        type=float,
+        default=0.25,
+        help=(
+            "For target density weighting, added weight per training density "
+            "standard deviation above the mean. Weights are renormalized to "
+            "mean one at each rollout step (default: 0.25)."
+        ),
+    )
+    parser.add_argument(
         "--autoregressive-steps",
         type=int,
         default=1,
@@ -1601,6 +1748,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "Use a separately encoded static face attribute ('static', "
             "backward-compatible) or the state-conditioned processed forward "
             "directed-edge latent ('processed') in FluxGraphNet's face decoder."
+        ),
+    )
+    add_boolean_argument(
+        parser,
+        "antisymmetric-flux-decoder",
+        default=False,
+        help_text=(
+            "For processed FluxGraphNet edge features, decode both directions "
+            "of each face and use half their physical-flux difference."
         ),
     )
     parser.add_argument("--learning-rate", type=float, default=1.0e-3)
@@ -1720,6 +1876,18 @@ def validate_args(args: argparse.Namespace, *, max_steps: int) -> None:
             "node_loss_normalization must be one of "
             f"{NODE_LOSS_NORMALIZATIONS}; got {args.node_loss_normalization!r}."
         )
+    if args.node_density_weighting not in NODE_DENSITY_WEIGHTINGS:
+        raise ValueError(
+            "node_density_weighting must be one of "
+            f"{NODE_DENSITY_WEIGHTINGS}; got {args.node_density_weighting!r}."
+        )
+    if (
+        not np.isfinite(args.node_density_weight_strength)
+        or args.node_density_weight_strength < 0.0
+    ):
+        raise ValueError(
+            "node_density_weight_strength must be finite and nonnegative."
+        )
     if args.flux_decoder_edge_features not in FLUX_DECODER_EDGE_FEATURES:
         raise ValueError(
             "flux_decoder_edge_features must be one of "
@@ -1745,6 +1913,14 @@ def validate_args(args: argparse.Namespace, *, max_steps: int) -> None:
                 "At least one of node_weight_loss and flux_loss_weight must "
                 "be positive."
             )
+        if (
+            args.antisymmetric_flux_decoder
+            and args.flux_decoder_edge_features != "processed"
+        ):
+            raise ValueError(
+                "antisymmetric_flux_decoder requires "
+                "flux_decoder_edge_features='processed'."
+            )
     else:
         if args.decode_normalized_flux:
             raise ValueError(
@@ -1760,6 +1936,10 @@ def validate_args(args: argparse.Namespace, *, max_steps: int) -> None:
                 "flux_supervision_steps='first' is supported only for "
                 "FluxGraphNet."
             )
+        if args.antisymmetric_flux_decoder:
+            raise ValueError(
+                "antisymmetric_flux_decoder is supported only for FluxGraphNet."
+            )
     if args.gradient_clip_norm < 0.0:
         raise ValueError("gradient_clip_norm must be nonnegative.")
     if args.patience < 0 or args.num_workers < 0 or args.log_every <= 0:
@@ -1772,6 +1952,7 @@ def validate_args(args: argparse.Namespace, *, max_steps: int) -> None:
         "include_boundary_distances",
         "mass_projection",
         "decode_normalized_flux",
+        "antisymmetric_flux_decoder",
     )
     invalid_booleans = [
         name for name in boolean_options if not isinstance(getattr(args, name), bool)
@@ -1891,6 +2072,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         normalization=normalization,
         decode_normalized_flux=args.decode_normalized_flux,
         flux_decoder_edge_features=args.flux_decoder_edge_features,
+        antisymmetric_flux_decoder=args.antisymmetric_flux_decoder,
         flux_normalization=flux_normalization,
     )
     model = model.to(device)
@@ -1926,17 +2108,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     print(f"model: {args.model} ({type(model).__name__})")
     print(f"target_type: {args.target_type}")
     print(f"node_loss_normalization: {args.node_loss_normalization}")
+    print(f"node_density_weighting: {args.node_density_weighting}")
+    print(f"node_density_weight_strength: {args.node_density_weight_strength}")
     print(f"autoregressive_steps: {args.autoregressive_steps}")
     print(f"mass_projection: {args.mass_projection}")
     print(f"decode_normalized_flux: {args.decode_normalized_flux}")
     print(f"flux_decoder_edge_features: {args.flux_decoder_edge_features}")
+    print(f"antisymmetric_flux_decoder: {args.antisymmetric_flux_decoder}")
     print(f"node_weight_loss: {node_weight_loss}")
     print(f"flux_loss_weight: {flux_loss_weight}")
     print(f"flux_supervision_steps: {args.flux_supervision_steps}")
     if args.model != "fluxgraphnet":
         print(
-            "loss-weight config: ignored for this architecture; using the "
-            "standard unweighted node objective"
+            "node_weight_loss/flux_loss_weight: ignored for this architecture; "
+            "using a unit node-objective coefficient and no flux supervision"
         )
     if flux_normalization is not None:
         print(
@@ -1976,6 +2161,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             normalization=normalization,
             target_type=args.target_type,
             node_loss_normalization=args.node_loss_normalization,
+            node_density_weighting=args.node_density_weighting,
+            node_density_weight_strength=args.node_density_weight_strength,
             autoregressive_steps=args.autoregressive_steps,
             mass_projection=args.mass_projection,
             gradient_clip_norm=args.gradient_clip_norm,
@@ -1991,6 +2178,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             normalization=normalization,
             target_type=args.target_type,
             node_loss_normalization=args.node_loss_normalization,
+            node_density_weighting=args.node_density_weighting,
+            node_density_weight_strength=args.node_density_weight_strength,
             autoregressive_steps=args.autoregressive_steps,
             mass_projection=args.mass_projection,
             node_weight_loss=node_weight_loss,
@@ -2015,6 +2204,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             epochs_without_improvement += 1
 
         if epoch == 1 or epoch % args.log_every == 0 or epoch == args.epochs:
+            density_objective_text = (
+                " | train density-weighted nMSE "
+                f"{train_metrics['objective_node_mse']:.6e}"
+                " | val density-weighted nMSE "
+                f"{validation_metrics['objective_node_mse']:.6e}"
+                if args.node_density_weighting != "none"
+                else ""
+            )
             flux_text = (
                 f" | train flux nMSE {train_metrics['flux_normalized_mse']:.6e}"
                 f" | val flux nMSE {validation_metrics['flux_normalized_mse']:.6e}"
@@ -2028,6 +2225,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 f"val nMSE {validation_metrics['normalized_mse']:.6e} | "
                 f"val state RMSE {validation_metrics['next_state_rmse']:.6e} | "
                 f"val mass MAE {validation_metrics['mass_mae']:.6e}"
+                f"{density_objective_text}"
                 f"{flux_text}"
             )
         if args.patience > 0 and epochs_without_improvement >= args.patience:
@@ -2046,6 +2244,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         normalization=normalization,
         target_type=args.target_type,
         node_loss_normalization=args.node_loss_normalization,
+        node_density_weighting=args.node_density_weighting,
+        node_density_weight_strength=args.node_density_weight_strength,
         autoregressive_steps=args.autoregressive_steps,
         mass_projection=args.mass_projection,
         node_weight_loss=node_weight_loss,
@@ -2072,7 +2272,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "edge_attr_columns": str(data.get("edge_attr_columns", "")),
         "target_type": args.target_type,
         "node_loss_normalization": args.node_loss_normalization,
+        "node_density_weighting": args.node_density_weighting,
+        "node_density_weight_strength": args.node_density_weight_strength,
         "flux_decoder_edge_features": args.flux_decoder_edge_features,
+        "antisymmetric_flux_decoder": args.antisymmetric_flux_decoder,
         "autoregressive_steps": args.autoregressive_steps,
         "mass_projection": args.mass_projection,
         "node_weight_loss": node_weight_loss,
