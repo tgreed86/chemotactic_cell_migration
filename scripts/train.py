@@ -75,6 +75,8 @@ stored face orientation reverses the physical flux.
 FluxGraphNet decodes one signed transport per interior face and applies equal
 and opposite mass changes to the adjacent finite-volume cells.  It therefore
 conserves area-weighted mass by construction, including for ``state`` targets.
+Flux-decoder and direct-flux-supervision settings are accepted but completely
+ignored when ``model`` is ``sageconv`` or ``meshgraphnet``.
 
 Example:
 
@@ -1888,22 +1890,23 @@ def validate_args(args: argparse.Namespace, *, max_steps: int) -> None:
         raise ValueError(
             "node_density_weight_strength must be finite and nonnegative."
         )
-    if args.flux_decoder_edge_features not in FLUX_DECODER_EDGE_FEATURES:
-        raise ValueError(
-            "flux_decoder_edge_features must be one of "
-            f"{FLUX_DECODER_EDGE_FEATURES}; got "
-            f"{args.flux_decoder_edge_features!r}."
-        )
-    if args.flux_supervision_steps not in FLUX_SUPERVISION_STEPS:
-        raise ValueError(
-            "flux_supervision_steps must be one of "
-            f"{FLUX_SUPERVISION_STEPS}; got {args.flux_supervision_steps!r}."
-        )
     if not (0.0 <= args.dropout < 1.0):
         raise ValueError("dropout must be in [0, 1).")
     if args.learning_rate <= 0.0 or args.weight_decay < 0.0:
         raise ValueError("learning_rate must be positive and weight_decay nonnegative.")
     if args.model == "fluxgraphnet":
+        if args.flux_decoder_edge_features not in FLUX_DECODER_EDGE_FEATURES:
+            raise ValueError(
+                "flux_decoder_edge_features must be one of "
+                f"{FLUX_DECODER_EDGE_FEATURES}; got "
+                f"{args.flux_decoder_edge_features!r}."
+            )
+        if args.flux_supervision_steps not in FLUX_SUPERVISION_STEPS:
+            raise ValueError(
+                "flux_supervision_steps must be one of "
+                f"{FLUX_SUPERVISION_STEPS}; got "
+                f"{args.flux_supervision_steps!r}."
+            )
         if args.node_weight_loss < 0.0 or args.flux_loss_weight < 0.0:
             raise ValueError(
                 "node_weight_loss and flux_loss_weight must be nonnegative."
@@ -1921,25 +1924,6 @@ def validate_args(args: argparse.Namespace, *, max_steps: int) -> None:
                 "antisymmetric_flux_decoder requires "
                 "flux_decoder_edge_features='processed'."
             )
-    else:
-        if args.decode_normalized_flux:
-            raise ValueError(
-                "decode_normalized_flux is supported only for FluxGraphNet."
-            )
-        if args.flux_decoder_edge_features != "static":
-            raise ValueError(
-                "flux_decoder_edge_features='processed' is supported only for "
-                "FluxGraphNet."
-            )
-        if args.flux_supervision_steps != "all":
-            raise ValueError(
-                "flux_supervision_steps='first' is supported only for "
-                "FluxGraphNet."
-            )
-        if args.antisymmetric_flux_decoder:
-            raise ValueError(
-                "antisymmetric_flux_decoder is supported only for FluxGraphNet."
-            )
     if args.gradient_clip_norm < 0.0:
         raise ValueError("gradient_clip_norm must be nonnegative.")
     if args.patience < 0 or args.num_workers < 0 or args.log_every <= 0:
@@ -1951,9 +1935,12 @@ def validate_args(args: argparse.Namespace, *, max_steps: int) -> None:
         "include_absolute_positions",
         "include_boundary_distances",
         "mass_projection",
-        "decode_normalized_flux",
-        "antisymmetric_flux_decoder",
     )
+    if args.model == "fluxgraphnet":
+        boolean_options += (
+            "decode_normalized_flux",
+            "antisymmetric_flux_decoder",
+        )
     invalid_booleans = [
         name for name in boolean_options if not isinstance(getattr(args, name), bool)
     ]
@@ -2120,8 +2107,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     print(f"flux_supervision_steps: {args.flux_supervision_steps}")
     if args.model != "fluxgraphnet":
         print(
-            "node_weight_loss/flux_loss_weight: ignored for this architecture; "
-            "using a unit node-objective coefficient and no flux supervision"
+            "FluxGraphNet-only decoder, flux-supervision, and loss-coefficient "
+            "options: ignored for this architecture; using a unit node-objective "
+            "coefficient and no flux supervision"
         )
     if flux_normalization is not None:
         print(
