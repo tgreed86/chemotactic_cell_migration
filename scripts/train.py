@@ -6,11 +6,13 @@ trajectory-disjoint train/validation/test splits, normalization learned only
 from the training split, JSON configuration with command-line overrides,
 early stopping, and a self-contained checkpoint.
 
-The model input deliberately does *not* use a precomputed, state-dependent
-advection operator. At every rollout step the core node features are density,
-chemoattractant, cell area, and a boundary flag. The prescribed drift velocity
-chi*grad(c), chemotactic sensitivity chi, absolute center coordinates, and four
-distances to the rectangular domain boundaries are independently configurable.
+At every rollout step the core node features are density, chemoattractant,
+cell area, and a boundary flag. The prescribed drift velocity chi*grad(c),
+chemotactic sensitivity chi, absolute center coordinates, and four distances
+to the rectangular domain boundaries are independently configurable. A nested
+``physics_inputs`` config can additionally append a conservative finite-volume
+approximation of ``-div(n*chi*grad(c))``. This advection channel is recomputed
+from the current, possibly predicted, density during autoregressive rollout.
 
 All continuous channels are normalized with training-split statistics. The
 static chemical field and mesh features (and chi, when included) stay fixed
@@ -95,7 +97,7 @@ import copy
 import json
 import random
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -114,6 +116,15 @@ except ModuleNotFoundError as exc:
         "This script requires PyTorch and PyTorch Geometric. Install them "
         "for your platform and rerun the command."
     ) from exc
+
+from physics_inputs import (
+    PhysicsInputConfig,
+    build_physics_augmented_inputs_2d,
+    compute_adv_input_channel_2d,
+    count_physics_input_channels,
+    face_drift_speed_from_archive,
+    resolve_physics_input_cfg,
+)
 
 
 TARGET_TYPES = ("state", "delta", "rate")
@@ -529,6 +540,8 @@ class ChemotaxisRolloutDataset(torch.utils.data.Dataset):
         static_node_features: np.ndarray,
         edge_attr: np.ndarray,
         undirected_edge_attr: np.ndarray,
+        face_drift_speed: Optional[np.ndarray] = None,
+        shared_face_lengths: Optional[np.ndarray] = None,
         flux_targets: Optional[np.ndarray] = None,
     ) -> None:
         self.states = np.asarray(data["rollout_states"], dtype=np.float32)
@@ -540,6 +553,8 @@ class ChemotaxisRolloutDataset(torch.utils.data.Dataset):
         self.static_node_features = static_node_features
         self.edge_attr = edge_attr
         self.undirected_edge_attr = undirected_edge_attr
+        self.face_drift_speed = face_drift_speed
+        self.shared_face_lengths = shared_face_lengths
         self.flux_targets = flux_targets
         self.trajectory_ids = np.asarray(trajectory_ids, dtype=np.int64)
         self.autoregressive_steps = int(autoregressive_steps)
@@ -551,6 +566,25 @@ class ChemotaxisRolloutDataset(torch.utils.data.Dataset):
             raise ValueError(
                 "Expected exactly two directed edges per undirected interior face."
             )
+        if (self.face_drift_speed is None) != (self.shared_face_lengths is None):
+            raise ValueError(
+                "face_drift_speed and shared_face_lengths must be supplied together."
+            )
+        if self.face_drift_speed is not None:
+            expected_face_shape = (self.states.shape[0], self.num_faces, 1)
+            if self.face_drift_speed.shape != expected_face_shape:
+                raise ValueError(
+                    f"face_drift_speed has shape {self.face_drift_speed.shape}; "
+                    f"expected {expected_face_shape}."
+                )
+            if self.shared_face_lengths.shape not in (
+                expected_face_shape,
+                expected_face_shape[:-1],
+            ):
+                raise ValueError(
+                    "shared_face_lengths must have shape [trajectory, face] "
+                    "or [trajectory, face, 1]."
+                )
         self.forward_face_edge_mask = torch.arange(
             self.num_directed_edges
         ) < self.num_faces
@@ -601,6 +635,14 @@ class ChemotaxisRolloutDataset(torch.utils.data.Dataset):
             time_index=torch.tensor([start], dtype=torch.long),
             num_nodes=self.num_nodes,
         )
+        if self.face_drift_speed is not None:
+            face_lengths = self.shared_face_lengths[trajectory]
+            attributes["face_drift_speed"] = torch.from_numpy(
+                np.asarray(self.face_drift_speed[trajectory], dtype=np.float32)
+            )
+            attributes["shared_face_length"] = torch.from_numpy(
+                np.asarray(face_lengths, dtype=np.float32).reshape(self.num_faces, 1)
+            )
         if self.flux_targets is not None:
             flux_stop = start + self.autoregressive_steps
             # Face-major layout lets PyG concatenate per-graph face sequences.
@@ -1151,6 +1193,95 @@ def project_conservative_target(
     return current + projected_change if target_type == "state" else projected_change
 
 
+def build_model_input_features(
+    *,
+    current: Tensor,
+    static_node_features: Tensor,
+    batch: Data,
+    normalization: Normalization,
+    physics_cfg: PhysicsInputConfig,
+    step_k: int,
+) -> Tensor:
+    """Build the identical state/static/advection layout for every model."""
+    normalized_density = (
+        current - normalization.density_mean
+    ) / normalization.density_std
+    base_features = torch.cat(
+        (normalized_density, static_node_features), dim=-1
+    )
+    if not count_physics_input_channels(physics_cfg):
+        return base_features
+    required = ("face_drift_speed", "shared_face_length")
+    missing = [name for name in required if not hasattr(batch, name)]
+    if missing:
+        raise ValueError(
+            "Advection inputs require batch attributes: " + ", ".join(missing)
+        )
+    return build_physics_augmented_inputs_2d(
+        x_base=base_features,
+        x_state=current,
+        undirected_edge_index=batch.undirected_edge_index,
+        face_drift_speed=batch.face_drift_speed,
+        shared_face_length=batch.shared_face_length,
+        cell_area=batch.cell_area,
+        dt_node=batch.dt_node,
+        physics_cfg=physics_cfg,
+        step_k=step_k,
+    )
+
+
+@torch.no_grad()
+def fit_advection_input_normalization(
+    dataset: torch.utils.data.Dataset,
+    *,
+    physics_cfg: PhysicsInputConfig,
+    batch_size: int,
+) -> PhysicsInputConfig:
+    """Fit optional advection min/max using only training windows."""
+    if not (
+        count_physics_input_channels(physics_cfg)
+        and physics_cfg.normalize_adv_to_minus1_1
+    ):
+        return physics_cfg
+    if physics_cfg.adv_min is not None and physics_cfg.adv_max is not None:
+        return physics_cfg
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+    )
+    adv_min = float("inf")
+    adv_max = float("-inf")
+    for batch in loader:
+        advection = compute_adv_input_channel_2d(
+            x_state=batch.rollout[:, 0],
+            undirected_edge_index=batch.undirected_edge_index,
+            face_drift_speed=batch.face_drift_speed,
+            shared_face_length=batch.shared_face_length,
+            cell_area=batch.cell_area,
+            dt_node=batch.dt_node,
+            physics_cfg=physics_cfg,
+            step_k=0,
+        )
+        finite = advection[torch.isfinite(advection)]
+        if finite.numel() == 0:
+            continue
+        adv_min = min(adv_min, float(torch.min(finite)))
+        adv_max = max(adv_max, float(torch.max(finite)))
+    if not np.isfinite(adv_min) or not np.isfinite(adv_max):
+        raise ValueError(
+            "Advection normalization fitting found no finite training values."
+        )
+    if adv_max <= adv_min:
+        raise ValueError(
+            "Advection normalization fitting produced a degenerate interval: "
+            f"[{adv_min}, {adv_max}]."
+        )
+    return replace(physics_cfg, adv_min=adv_min, adv_max=adv_max)
+
+
 def predict_normalized_target(
     model: nn.Module, batch: Data, node_input: Tensor, current: Tensor
 ) -> Tensor:
@@ -1227,6 +1358,7 @@ def autoregressive_batch(
     flux_loss_weight: float,
     flux_supervision_steps: str,
     flux_normalization: Optional[FluxNormalization],
+    physics_cfg: Optional[PhysicsInputConfig] = None,
 ) -> Tuple[Tensor, Dict[str, float]]:
     """Unroll a batch and return differentiable loss plus detached metrics."""
     if node_loss_normalization not in NODE_LOSS_NORMALIZATIONS:
@@ -1253,6 +1385,7 @@ def autoregressive_batch(
         )
     if batch.rollout.shape[1] != autoregressive_steps + 1:
         raise ValueError("Batch rollout width does not match autoregressive_steps.")
+    resolved_physics_cfg = physics_cfg or PhysicsInputConfig()
     current = batch.rollout[:, 0]
     total_node_loss = current.new_zeros(())
     total_flux_loss = current.new_zeros(())
@@ -1276,11 +1409,13 @@ def autoregressive_batch(
     )
 
     for step in range(autoregressive_steps):
-        normalized_density = (
-            current - normalization.density_mean
-        ) / normalization.density_std
-        node_input = torch.cat(
-            (normalized_density, batch.static_node_features), dim=-1
+        node_input = build_model_input_features(
+            current=current,
+            static_node_features=batch.static_node_features,
+            batch=batch,
+            normalization=normalization,
+            physics_cfg=resolved_physics_cfg,
+            step_k=step,
         )
         predicted_flux = None
         supervise_flux = flux_loss_weight > 0.0 and (
@@ -1419,6 +1554,7 @@ def train_epoch(
     flux_loss_weight: float,
     flux_supervision_steps: str,
     flux_normalization: Optional[FluxNormalization],
+    physics_cfg: Optional[PhysicsInputConfig] = None,
 ) -> Dict[str, float]:
     model.train()
     weighted_metrics = {
@@ -1447,6 +1583,7 @@ def train_epoch(
             flux_loss_weight=flux_loss_weight,
             flux_supervision_steps=flux_supervision_steps,
             flux_normalization=flux_normalization,
+            physics_cfg=physics_cfg,
         )
         loss.backward()
         if gradient_clip_norm > 0.0:
@@ -1500,6 +1637,7 @@ def evaluate(
     flux_loss_weight: float,
     flux_supervision_steps: str,
     flux_normalization: Optional[FluxNormalization],
+    physics_cfg: Optional[PhysicsInputConfig] = None,
 ) -> Dict[str, float]:
     model.eval()
     accumulated = {
@@ -1527,6 +1665,7 @@ def evaluate(
             flux_loss_weight=flux_loss_weight,
             flux_supervision_steps=flux_supervision_steps,
             flux_normalization=flux_normalization,
+            physics_cfg=physics_cfg,
         )
         weight = int(batch.num_graphs) * autoregressive_steps
         graph_steps += weight
@@ -1624,6 +1763,17 @@ def add_boolean_argument(
     parser.set_defaults(**{destination: default})
 
 
+def parse_json_object(value: str) -> Dict[str, object]:
+    """Parse a command-line JSON object for nested configuration options."""
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"invalid JSON object: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("expected a JSON object")
+    return parsed
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train a configurable GNN on chemotaxis trajectories."
@@ -1639,6 +1789,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model", choices=MODEL_NAMES, default="sageconv")
     parser.add_argument("--target-type", choices=TARGET_TYPES, default="delta")
+    parser.add_argument(
+        "--physics-inputs",
+        type=parse_json_object,
+        default={},
+        metavar="JSON",
+        help=(
+            "Optional chemotactic-advection input settings as a JSON object. "
+            "Config files may provide the same object directly under "
+            "'physics_inputs'."
+        ),
+    )
     parser.add_argument(
         "--node-loss-normalization",
         choices=NODE_LOSS_NORMALIZATIONS,
@@ -1953,6 +2114,9 @@ def validate_args(args: argparse.Namespace, *, max_steps: int) -> None:
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parse_args(argv)
+    physics_cfg = resolve_physics_input_cfg(
+        {"physics_inputs": args.physics_inputs}
+    )
     data = load_archive(args.data)
     max_steps = int(data["rollout_states"].shape[1] - 1)
     validate_args(args, max_steps=max_steps)
@@ -2004,6 +2168,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         include_absolute_positions=args.include_absolute_positions,
         include_boundary_distances=args.include_boundary_distances,
     )
+    physics_channels = count_physics_input_channels(physics_cfg)
+    face_drift_speed = None
+    shared_face_lengths = None
+    if physics_channels:
+        face_drift_speed = face_drift_speed_from_archive(data)
+        if "shared_face_lengths" not in data:
+            raise KeyError(
+                "Advection inputs require shared_face_lengths in the dataset."
+            )
+        shared_face_lengths = np.asarray(
+            data["shared_face_lengths"], dtype=np.float32
+        )
     datasets = {
         name: ChemotaxisRolloutDataset(
             data=data,
@@ -2012,10 +2188,19 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             static_node_features=static_node_features,
             edge_attr=edge_attr,
             undirected_edge_attr=undirected_edge_attr,
+            face_drift_speed=face_drift_speed,
+            shared_face_lengths=shared_face_lengths,
             flux_targets=flux_targets,
         )
         for name, trajectory_ids in split_ids.items()
     }
+
+    physics_cfg = fit_advection_input_normalization(
+        datasets["train"],
+        physics_cfg=physics_cfg,
+        batch_size=args.batch_size,
+    )
+    args.physics_inputs = asdict(physics_cfg)
 
     loader_generator = torch.Generator()
     loader_generator.manual_seed(args.seed)
@@ -2045,7 +2230,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         ),
     }
 
-    input_channels = 1 + int(static_node_features.shape[-1])
+    input_channels = (
+        1 + int(static_node_features.shape[-1]) + physics_channels
+    )
     edge_attr_channels = int(edge_attr.shape[-1])
     model, model_kwargs = build_model(
         args.model,
@@ -2091,6 +2278,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         *[f"normalized_{name}" for name in continuous_feature_names],
         "boundary_cell",
     ]
+    if physics_channels:
+        advection_name = f"chemotaxis_advection_{physics_cfg.input_form}"
+        if physics_cfg.normalize_adv_to_minus1_1:
+            advection_name = "normalized_" + advection_name
+        feature_names.append(advection_name)
     print(f"device: {device}")
     print(f"model: {args.model} ({type(model).__name__})")
     print(f"target_type: {args.target_type}")
@@ -2105,6 +2297,24 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     print(f"node_weight_loss: {node_weight_loss}")
     print(f"flux_loss_weight: {flux_loss_weight}")
     print(f"flux_supervision_steps: {args.flux_supervision_steps}")
+    print(
+        "physics inputs: "
+        f"enabled={physics_cfg.enabled}, "
+        f"include_adv={physics_cfg.include_adv}, "
+        f"input_form={physics_cfg.input_form}, "
+        f"advection_scheme={physics_cfg.advection_scheme}, "
+        f"adv_all_steps={physics_cfg.adv_all_steps}, "
+        f"normalize_adv_to_minus1_1="
+        f"{physics_cfg.normalize_adv_to_minus1_1}, "
+        f"total_model_in_channels={input_channels}"
+    )
+    if physics_channels and physics_cfg.normalize_adv_to_minus1_1:
+        print(
+            "advection normalization: "
+            f"min={physics_cfg.adv_min:.6e}, "
+            f"max={physics_cfg.adv_max:.6e}, "
+            f"clip={physics_cfg.normalize_adv_clip}"
+        )
     if args.model != "fluxgraphnet":
         print(
             "FluxGraphNet-only decoder, flux-supervision, and loss-coefficient "
@@ -2131,7 +2341,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         f"interior_faces={data['undirected_edge_index'].shape[2]}"
     )
     print("node inputs: " + ", ".join(feature_names))
-    print("state-dependent physics-operator inputs: none")
 
     best_state: Optional[Dict[str, Tensor]] = None
     best_validation = float("inf")
@@ -2158,6 +2367,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             flux_loss_weight=flux_loss_weight,
             flux_supervision_steps=args.flux_supervision_steps,
             flux_normalization=flux_normalization,
+            physics_cfg=physics_cfg,
         )
         validation_metrics = evaluate(
             model,
@@ -2174,6 +2384,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             flux_loss_weight=flux_loss_weight,
             flux_supervision_steps=args.flux_supervision_steps,
             flux_normalization=flux_normalization,
+            physics_cfg=physics_cfg,
         )
         entry: Dict[str, float] = {"epoch": float(epoch)}
         entry.update({f"train_{key}": value for key, value in train_metrics.items()})
@@ -2240,6 +2451,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         flux_loss_weight=flux_loss_weight,
         flux_supervision_steps=args.flux_supervision_steps,
         flux_normalization=flux_normalization,
+        physics_cfg=physics_cfg,
     )
 
     checkpoint = {
@@ -2257,6 +2469,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "include_absolute_positions": args.include_absolute_positions,
             "include_boundary_distances": args.include_boundary_distances,
         },
+        "physics_inputs": asdict(physics_cfg),
         "edge_attr_columns": str(data.get("edge_attr_columns", "")),
         "target_type": args.target_type,
         "node_loss_normalization": args.node_loss_normalization,
