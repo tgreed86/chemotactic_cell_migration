@@ -53,6 +53,8 @@ Important output arrays:
     rollout_states: [num_samples, window + 1, num_cells, 1]
     chemoattractant: [num_samples, num_cells, 1]
     chemo_gradient, drift_velocity: [num_samples, num_cells, 2]
+    face_drift_speed: [num_samples, num_undirected_edges, 1]
+        chi*grad(c).normal evaluated at each oriented coarse face midpoint.
     chi: [num_samples]
         Chemotactic sensitivity sampled once per trajectory and held constant
         across space and time. With ``--chi``, every entry is identical.
@@ -1240,6 +1242,7 @@ def save_dataset(
     chemo: np.ndarray,
     chemo_gradient: np.ndarray,
     drift_velocity: np.ndarray,
+    face_drift_speed: np.ndarray,
     vertices: np.ndarray,
     triangles: np.ndarray,
     centers: np.ndarray,
@@ -1291,6 +1294,7 @@ def save_dataset(
         chemoattractant=chemo[..., None].astype(np.float32),
         chemo_gradient=chemo_gradient.astype(np.float32),
         drift_velocity=drift_velocity.astype(np.float32),
+        face_drift_speed=face_drift_speed[..., None].astype(np.float32),
         pos=centers.astype(np.float32),
         edge_index=graph["edge_index"].astype(np.int64),
         edge_attr=graph["edge_attr"].astype(np.float32),
@@ -1870,6 +1874,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         chemo=chemo,
         chemo_gradient=chemo_gradient,
         drift_velocity=drift_velocity,
+        face_drift_speed=coarse_drift_speed,
         vertices=vertices,
         triangles=triangles,
         centers=centers,
