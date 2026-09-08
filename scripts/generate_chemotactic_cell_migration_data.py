@@ -43,6 +43,13 @@ To make trajectories differ only through their initial cell densities, add
 ``--shared-mesh --shared-chemoattractant`` and use ``--chi VALUE`` (rather
 than ``--chi-range``).
 
+For memory-efficient incremental generation, add
+``--one-trajectory-at-a-time``. The generator first finds a common stable
+timestep, then generates and saves each trajectory independently as
+``OUT_DIR/trajectory_NNNNN.npz``. If ``OUT`` ends in ``.npz``, ``OUT_DIR`` is
+the path without that suffix. It does not create a combined archive in this
+mode.
+
 Important output arrays:
 
     x: [num_samples * window, num_cells, 4]
@@ -82,6 +89,7 @@ actual number of reference substeps making one supervised transition.
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -90,6 +98,25 @@ import numpy as np
 
 MESH_MODES = ("delaunay", "jittered_triangles")
 TARGET_TYPES = ("increment", "rate", "next")
+
+
+def print_progress(
+    *,
+    stage: str,
+    completed: int,
+    total: int,
+    stage_started_at: float,
+    previous_report_at: float,
+) -> float:
+    """Print elapsed timing for a generation stage and return the report time."""
+    reported_at = time.perf_counter()
+    print(
+        f"{stage}: {completed}/{total} "
+        f"(last interval: {reported_at - previous_report_at:.1f}s, "
+        f"elapsed: {reported_at - stage_started_at:.1f}s)",
+        flush=True,
+    )
+    return reported_at
 
 
 def make_perturbed_vertices(
@@ -386,6 +413,87 @@ def _stack_mesh_graphs(
             )
         result[key] = np.stack([graph[key] for graph in graphs], axis=0)
     return result
+
+
+def create_mesh_bundle(
+    *, args: argparse.Namespace, rng: np.random.Generator, domain_area: float
+) -> Dict[str, object]:
+    """Create one coarse/reference mesh pair and its graph geometry."""
+    vertices = make_perturbed_vertices(
+        nx=args.nx,
+        ny=args.ny,
+        lx=args.lx,
+        ly=args.ly,
+        jitter=args.mesh_jitter,
+        rng=rng,
+    )
+    triangles = triangulate_vertices(
+        vertices=vertices,
+        nx=args.nx,
+        ny=args.ny,
+        mesh_mode=args.mesh_mode,
+        rng=rng,
+    )
+    centers, areas, quadrature = triangle_geometry(
+        vertices=vertices, triangles=triangles
+    )
+    if not np.isclose(
+        np.sum(areas), domain_area, rtol=1.0e-10, atol=1.0e-12
+    ):
+        raise ValueError("Triangle areas do not sum to the domain area.")
+    graph = build_cell_graph(
+        vertices=vertices,
+        triangles=triangles,
+        centers=centers,
+        areas=areas,
+    )
+    reference_vertices, reference_triangles, reference_parent = (
+        refine_triangular_mesh(
+            vertices=vertices,
+            triangles=triangles,
+            levels=args.reference_refinement_levels,
+        )
+    )
+    reference_centers, reference_areas, reference_quadrature = triangle_geometry(
+        vertices=reference_vertices, triangles=reference_triangles
+    )
+    reference_graph = build_cell_graph(
+        vertices=reference_vertices,
+        triangles=reference_triangles,
+        centers=reference_centers,
+        areas=reference_areas,
+    )
+    return {
+        "vertices": vertices,
+        "triangles": triangles,
+        "centers": centers,
+        "areas": areas,
+        "quadrature": quadrature,
+        "graph": graph,
+        "reference_vertices": reference_vertices,
+        "reference_triangles": reference_triangles,
+        "reference_centers": reference_centers,
+        "reference_areas": reference_areas,
+        "reference_quadrature": reference_quadrature,
+        "reference_parent": reference_parent,
+        "reference_graph": reference_graph,
+    }
+
+
+def batch_mesh_bundle(bundle: Dict[str, object]) -> Dict[str, object]:
+    """Add a length-one trajectory dimension to a mesh bundle."""
+    result: Dict[str, object] = {}
+    for key, value in bundle.items():
+        if key in {"graph", "reference_graph"}:
+            result[key] = _stack_mesh_graphs([value])
+        else:
+            result[key] = np.asarray(value)[None, ...]
+    return result
+
+
+def component_rng(seed: int, stream: int, trajectory: int = 0) -> np.random.Generator:
+    """Return a reproducible RNG stream for incremental generation."""
+    return np.random.default_rng(np.random.SeedSequence([seed, stream, trajectory]))
 
 
 def _sample_centers(
@@ -1152,6 +1260,7 @@ def generate_rollouts(
     solver_dt: float,
     window: int,
     substeps_per_frame: int,
+    progress_every: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Generate density trajectories and exact coarse-face transport labels."""
     if window <= 0:
@@ -1182,6 +1291,8 @@ def generate_rollouts(
     interface_flux_transport = np.zeros(
         (num_samples, window, num_coarse_faces), dtype=np.float64
     )
+    rollout_started_at = time.perf_counter()
+    previous_report_at = rollout_started_at
     for frame in range(window):
         frame_transport = np.zeros(
             (num_samples, undirected_edges.shape[2]), dtype=np.float64
@@ -1214,6 +1325,17 @@ def generate_rollouts(
             coarse_parent=coarse_parent,
             coarse_areas=coarse_areas,
         )
+        completed = frame + 1
+        if progress_every > 0 and (
+            completed % progress_every == 0 or completed == window
+        ):
+            previous_report_at = print_progress(
+                stage=f"Generated rollout frames for {num_samples} trajectories",
+                completed=completed,
+                total=window,
+                stage_started_at=rollout_started_at,
+                previous_report_at=previous_report_at,
+            )
     return rollout, interface_flux_transport
 
 
@@ -1319,6 +1441,528 @@ def save_dataset(
         total_mass=total_mass.astype(np.float64),
         **_metadata_to_npz(metadata),
     )
+
+
+def build_dataset_metadata(
+    *,
+    args: argparse.Namespace,
+    trajectory_chi: np.ndarray,
+    chi_sampling: str,
+    chi_distribution_min: float,
+    chi_distribution_max: float,
+    vertices: np.ndarray,
+    triangles: np.ndarray,
+    areas: np.ndarray,
+    graph: Dict[str, np.ndarray],
+    reference_vertices: np.ndarray,
+    reference_triangles: np.ndarray,
+    coarse_stable_dt: float,
+    reference_stable_dt: float,
+    nominal_coarse_dt: float,
+    solver_dt: float,
+    reference_substeps_per_frame: int,
+    frame_dt: float,
+    rollout: np.ndarray,
+    coarse_trajectory_max_rates: np.ndarray,
+    reference_trajectory_max_rates: np.ndarray,
+    max_flux_balance_error: float,
+    max_mass_error: float,
+    chemo_metadata: Dict[str, np.ndarray],
+    density_metadata: Dict[str, np.ndarray],
+    extra_metadata: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    """Build archive metadata shared by monolithic and sharded generation."""
+    num_samples = int(rollout.shape[0])
+    edge_attr_columns = (
+        "delta_x,delta_y,distance,unit_x,unit_y,shared_face_length,"
+        "face_normal_x,face_normal_y,center_normal_distance,transmissibility,"
+        "source_cell_area,target_cell_area,"
+        "source_is_boundary_cell"
+    )
+    metadata: Dict[str, object] = {
+        "model": "prescribed_chemoattractant_drift_diffusion",
+        "equation": "n_t + div(chi*n*grad(c) - D*grad(n)) = 0",
+        "boundary": "no_flux",
+        "state_representation": "triangle_cell_average",
+        "chemoattractant_evolution": "prescribed_static_in_time",
+        "chemoattractant_landscape": (
+            "shared_across_trajectories"
+            if args.shared_chemoattractant
+            else "unique_per_trajectory"
+        ),
+        "num_unique_chemoattractant_landscapes": int(
+            1 if args.shared_chemoattractant else num_samples
+        ),
+        "mesh_geometry": (
+            "shared_across_trajectories_static_in_time"
+            if args.shared_mesh
+            else "unique_per_trajectory_static_in_time"
+        ),
+        "num_unique_meshes": int(1 if args.shared_mesh else num_samples),
+        "mesh_mode": str(args.mesh_mode),
+        "mesh_jitter": float(args.mesh_jitter),
+        "nx": int(args.nx),
+        "ny": int(args.ny),
+        "num_mesh_vertices": int(vertices.shape[1]),
+        "num_cells": int(triangles.shape[1]),
+        "num_undirected_edges": int(graph["undirected_edge_index"].shape[2]),
+        "num_boundary_faces": int(graph["boundary_faces"].shape[1]),
+        "lx": float(args.lx),
+        "ly": float(args.ly),
+        "domain_area": float(args.lx * args.ly),
+        "cell_area_min": float(np.min(areas)),
+        "cell_area_mean": float(np.mean(areas)),
+        "cell_area_max": float(np.max(areas)),
+        "diffusion": float(args.diffusion),
+        "chi": trajectory_chi,
+        "chi_sampling": chi_sampling,
+        "chi_shared_across_trajectories": bool(
+            np.all(trajectory_chi == trajectory_chi[0])
+        ),
+        "num_unique_chi_values": int(np.unique(trajectory_chi).size),
+        "chi_min": chi_distribution_min,
+        "chi_max": chi_distribution_max,
+        "chi_sample_min": float(np.min(trajectory_chi)),
+        "chi_sample_max": float(np.max(trajectory_chi)),
+        "CFL": float(args.CFL),
+        "reference_CFL": float(args.reference_cfl),
+        "coarse_solver_dt_stability_limit": float(coarse_stable_dt),
+        "reference_solver_dt_stability_limit": float(reference_stable_dt),
+        "solver_dt_stability_limit": float(reference_stable_dt),
+        "nominal_coarse_solver_dt": float(nominal_coarse_dt),
+        "solver_dt": float(solver_dt),
+        "requested_substeps_per_frame": int(args.substeps_per_frame),
+        "substeps_per_frame": int(reference_substeps_per_frame),
+        "dt": float(frame_dt),
+        "reference_refinement_levels": int(args.reference_refinement_levels),
+        "reference_num_mesh_vertices": int(reference_vertices.shape[1]),
+        "reference_num_cells": int(reference_triangles.shape[1]),
+        "reference_spatial_scheme": (
+            "barth_jespersen_muscl_face_normal_nonorthogonal_finite_volume"
+        ),
+        "reference_time_integrator": "SSP_RK2",
+        "reference_projection": "sum_child_mass_divide_parent_area",
+        "interface_flux_reference": (
+            "integrated_refined_ssp_rk2_face_flux_aggregated_to_coarse_faces"
+        ),
+        "interface_flux_orientation": "undirected_edge_index_source_to_target",
+        "interface_flux_transport_units": "mass_per_stored_frame",
+        "interface_flux_rate_units": "mass_per_time",
+        "max_abs_interface_flux_balance_error": max_flux_balance_error,
+        "num_samples": num_samples,
+        "window": int(args.window),
+        "num_pairs": int(num_samples * args.window),
+        "target_type": str(args.target_type),
+        "x_columns": "cell_density,chemoattractant,drift_velocity_x,drift_velocity_y",
+        "edge_attr_columns": edge_attr_columns,
+        "seed": int(args.seed),
+        "chemo_sources_min": int(args.chemo_sources_min),
+        "chemo_sources_max": int(args.chemo_sources_max),
+        "chemo_amplitude_min": float(args.chemo_amplitude_min),
+        "chemo_amplitude_max": float(args.chemo_amplitude_max),
+        "chemo_sigma_min": float(args.chemo_sigma_min),
+        "chemo_sigma_max": float(args.chemo_sigma_max),
+        "chemo_baseline": float(args.chemo_baseline),
+        "source_margin_fraction": float(args.source_margin_fraction),
+        "density_blobs_min": int(args.density_blobs_min),
+        "density_blobs_max": int(args.density_blobs_max),
+        "density_amplitude_min": float(args.density_amplitude_min),
+        "density_amplitude_max": float(args.density_amplitude_max),
+        "density_sigma_min": float(args.density_sigma_min),
+        "density_sigma_max": float(args.density_sigma_max),
+        "density_background_min": float(args.density_background_min),
+        "density_background_max": float(args.density_background_max),
+        "density_margin_fraction": float(args.density_margin_fraction),
+        "primary_separation": float(args.primary_separation),
+        "trajectory_max_outgoing_rate": reference_trajectory_max_rates,
+        "coarse_trajectory_max_outgoing_rate": coarse_trajectory_max_rates,
+        "density_min_observed": float(np.min(rollout)),
+        "density_max_observed": float(np.max(rollout)),
+        "max_abs_mass_error": max_mass_error,
+        **chemo_metadata,
+        **density_metadata,
+    }
+    if extra_metadata:
+        metadata.update(extra_metadata)
+    return metadata
+
+
+def trajectory_output_path(base_path: Path, trajectory: int, total: int) -> Path:
+    """Return the deterministic shard path for one trajectory."""
+    output_directory = (
+        base_path.with_suffix("") if base_path.suffix.lower() == ".npz" else base_path
+    )
+    width = max(5, len(str(total - 1)))
+    return output_directory / f"trajectory_{trajectory:0{width}d}.npz"
+
+
+def trajectory_chemoattractant(
+    *,
+    args: argparse.Namespace,
+    quadrature_points: np.ndarray,
+    trajectory: int,
+    shared_metadata: Optional[Dict[str, np.ndarray]],
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray]]:
+    """Generate or evaluate the chemoattractant for one trajectory."""
+    if shared_metadata is not None:
+        chemo, gradient = evaluate_chemoattractant_fields(
+            quadrature_points=quadrature_points,
+            metadata=shared_metadata,
+            baseline=args.chemo_baseline,
+        )
+        return chemo, gradient, {
+            key: np.asarray(value).copy() for key, value in shared_metadata.items()
+        }
+    return generate_chemoattractant_fields(
+        num_samples=1,
+        quadrature_points=quadrature_points,
+        lx=args.lx,
+        ly=args.ly,
+        num_sources_min=args.chemo_sources_min,
+        num_sources_max=args.chemo_sources_max,
+        amplitude_min=args.chemo_amplitude_min,
+        amplitude_max=args.chemo_amplitude_max,
+        sigma_min=args.chemo_sigma_min,
+        sigma_max=args.chemo_sigma_max,
+        baseline=args.chemo_baseline,
+        margin_fraction=args.source_margin_fraction,
+        shared_across_trajectories=args.shared_chemoattractant,
+        rng=component_rng(args.seed, 2, 0 if args.shared_chemoattractant else trajectory),
+    )
+
+
+def validate_single_trajectory(
+    *,
+    rollout: np.ndarray,
+    interface_flux_transport: np.ndarray,
+    areas: np.ndarray,
+    undirected_edge_index: np.ndarray,
+) -> Tuple[float, float]:
+    """Validate conservation and flux balance for one generated trajectory."""
+    flux_implied_mass_change = np.zeros_like(rollout[:, 1:])
+    cell_i, cell_j = undirected_edge_index[0]
+    for frame in range(rollout.shape[1] - 1):
+        np.add.at(
+            flux_implied_mass_change[0, frame],
+            cell_i,
+            -interface_flux_transport[0, frame],
+        )
+        np.add.at(
+            flux_implied_mass_change[0, frame],
+            cell_j,
+            interface_flux_transport[0, frame],
+        )
+    observed_mass_change = (rollout[:, 1:] - rollout[:, :-1]) * areas[:, None, :]
+    max_flux_balance_error = float(
+        np.max(np.abs(flux_implied_mass_change - observed_mass_change))
+    )
+    if max_flux_balance_error > 1.0e-10:
+        raise RuntimeError(
+            "Aggregated reference face transports do not reproduce the stored "
+            f"coarse-state update (max error {max_flux_balance_error:.8e})."
+        )
+    total_mass = np.sum(rollout * areas[:, None, :], axis=2)
+    max_mass_error = float(np.max(np.abs(total_mass - total_mass[:, [0]])))
+    minimum_density = float(np.min(rollout))
+    if minimum_density < -1.0e-10:
+        raise RuntimeError(
+            f"Generated density became negative ({minimum_density:.8e}); "
+            "reduce CFL or solver_dt."
+        )
+    return max_flux_balance_error, max_mass_error
+
+
+def generate_trajectory_shards(args: argparse.Namespace) -> None:
+    """Generate and save one trajectory at a time using a common timestep."""
+    generation_started_at = time.perf_counter()
+    domain_area = float(args.lx * args.ly)
+    if args.chi_range is None:
+        trajectory_chi = np.full(args.num_samples, args.chi, dtype=np.float64)
+        chi_sampling = "fixed"
+        chi_distribution_min = float(args.chi)
+        chi_distribution_max = float(args.chi)
+    else:
+        chi_min, chi_max = args.chi_range
+        trajectory_chi = component_rng(args.seed, 4).uniform(
+            chi_min, chi_max, size=args.num_samples
+        )
+        chi_sampling = "uniform_per_trajectory"
+        chi_distribution_min = float(chi_min)
+        chi_distribution_max = float(chi_max)
+
+    shared_mesh = None
+    if args.shared_mesh:
+        shared_mesh = create_mesh_bundle(
+            args=args,
+            rng=component_rng(args.seed, 1),
+            domain_area=domain_area,
+        )
+
+    def mesh_for(trajectory: int) -> Dict[str, object]:
+        if shared_mesh is not None:
+            return shared_mesh
+        return create_mesh_bundle(
+            args=args,
+            rng=component_rng(args.seed, 1, trajectory),
+            domain_area=domain_area,
+        )
+
+    shared_chemo_metadata = None
+    if args.shared_chemoattractant:
+        first_mesh = batch_mesh_bundle(mesh_for(0))
+        _, _, shared_chemo_metadata = trajectory_chemoattractant(
+            args=args,
+            quadrature_points=first_mesh["quadrature"],
+            trajectory=0,
+            shared_metadata=None,
+        )
+
+    # A stability-only pass finds one timestep that is valid for every shard.
+    coarse_stable_steps = np.empty(args.num_samples, dtype=np.float64)
+    reference_stable_steps = np.empty(args.num_samples, dtype=np.float64)
+    coarse_max_rates = np.empty(args.num_samples, dtype=np.float64)
+    reference_max_rates = np.empty(args.num_samples, dtype=np.float64)
+    stability_started_at = time.perf_counter()
+    previous_report_at = stability_started_at
+    for trajectory in range(args.num_samples):
+        mesh = batch_mesh_bundle(mesh_for(trajectory))
+        _, _, chemo_metadata = trajectory_chemoattractant(
+            args=args,
+            quadrature_points=mesh["quadrature"],
+            trajectory=trajectory,
+            shared_metadata=shared_chemo_metadata,
+        )
+        chi = trajectory_chi[trajectory : trajectory + 1]
+        graph = mesh["graph"]
+        reference_graph = mesh["reference_graph"]
+        coarse_drift_speed = face_drift_velocity(
+            face_midpoints=graph["shared_face_midpoints"],
+            face_normals=graph["shared_face_normals"],
+            chemo_metadata=chemo_metadata,
+            chi=chi,
+        )
+        reference_drift_speed = face_drift_velocity(
+            face_midpoints=reference_graph["shared_face_midpoints"],
+            face_normals=reference_graph["shared_face_normals"],
+            chemo_metadata=chemo_metadata,
+            chi=chi,
+        )
+        coarse_dt, coarse_rate = stable_explicit_timestep(
+            areas=mesh["areas"],
+            undirected_edges=graph["undirected_edge_index"],
+            shared_face_lengths=graph["shared_face_lengths"],
+            center_normal_distances=graph["center_normal_distances"],
+            drift_speed=coarse_drift_speed,
+            diffusion=args.diffusion,
+            cfl=args.CFL,
+        )
+        reference_dt, reference_rate = stable_explicit_timestep(
+            areas=mesh["reference_areas"],
+            undirected_edges=reference_graph["undirected_edge_index"],
+            shared_face_lengths=reference_graph["shared_face_lengths"],
+            center_normal_distances=reference_graph["center_normal_distances"],
+            drift_speed=reference_drift_speed,
+            diffusion=args.diffusion,
+            cfl=args.reference_cfl,
+        )
+        coarse_stable_steps[trajectory] = coarse_dt
+        reference_stable_steps[trajectory] = reference_dt
+        coarse_max_rates[trajectory] = coarse_rate[0]
+        reference_max_rates[trajectory] = reference_rate[0]
+        completed = trajectory + 1
+        if args.progress_every > 0 and (
+            completed % args.progress_every == 0 or completed == args.num_samples
+        ):
+            previous_report_at = print_progress(
+                stage="Analyzed trajectory stability",
+                completed=completed,
+                total=args.num_samples,
+                stage_started_at=stability_started_at,
+                previous_report_at=previous_report_at,
+            )
+
+    collection_coarse_stable_dt = float(np.min(coarse_stable_steps))
+    collection_reference_stable_dt = float(np.min(reference_stable_steps))
+    if args.solver_dt is None:
+        nominal_coarse_dt = collection_coarse_stable_dt
+    else:
+        if args.solver_dt <= 0.0:
+            raise ValueError("solver_dt must be positive.")
+        if args.solver_dt > collection_coarse_stable_dt * (1.0 + 1.0e-12):
+            raise ValueError(
+                f"Requested solver_dt={args.solver_dt:.8e} exceeds the "
+                "most restrictive coarse-grid stable step "
+                f"{collection_coarse_stable_dt:.8e}."
+            )
+        nominal_coarse_dt = float(args.solver_dt)
+    frame_dt = nominal_coarse_dt * args.substeps_per_frame
+    reference_substeps_per_frame = max(
+        args.substeps_per_frame,
+        int(np.ceil(frame_dt / collection_reference_stable_dt - 1.0e-12)),
+    )
+    solver_dt = frame_dt / reference_substeps_per_frame
+
+    first_output = trajectory_output_path(args.out, 0, args.num_samples)
+    last_output = trajectory_output_path(
+        args.out, args.num_samples - 1, args.num_samples
+    )
+    print("Generating trajectories one at a time", flush=True)
+    print(f"  output range: {first_output} ... {last_output}", flush=True)
+    print(f"  common stored-frame dt: {frame_dt:.8e}", flush=True)
+    print(
+        f"  reference substeps per stored frame: {reference_substeps_per_frame}",
+        flush=True,
+    )
+
+    trajectories_started_at = time.perf_counter()
+    previous_report_at = trajectories_started_at
+    for trajectory in range(args.num_samples):
+        mesh = batch_mesh_bundle(mesh_for(trajectory))
+        chemo, chemo_gradient, chemo_metadata = trajectory_chemoattractant(
+            args=args,
+            quadrature_points=mesh["quadrature"],
+            trajectory=trajectory,
+            shared_metadata=shared_chemo_metadata,
+        )
+        reference_density0, density_metadata = generate_initial_density(
+            num_samples=1,
+            quadrature_points=mesh["reference_quadrature"],
+            chemo_metadata=chemo_metadata,
+            lx=args.lx,
+            ly=args.ly,
+            num_blobs_min=args.density_blobs_min,
+            num_blobs_max=args.density_blobs_max,
+            amplitude_min=args.density_amplitude_min,
+            amplitude_max=args.density_amplitude_max,
+            sigma_min=args.density_sigma_min,
+            sigma_max=args.density_sigma_max,
+            background_min=args.density_background_min,
+            background_max=args.density_background_max,
+            margin_fraction=args.density_margin_fraction,
+            primary_separation=args.primary_separation,
+            rng=component_rng(args.seed, 3, trajectory),
+        )
+        chi = trajectory_chi[trajectory : trajectory + 1]
+        graph = mesh["graph"]
+        reference_graph = mesh["reference_graph"]
+        coarse_drift_speed = face_drift_velocity(
+            face_midpoints=graph["shared_face_midpoints"],
+            face_normals=graph["shared_face_normals"],
+            chemo_metadata=chemo_metadata,
+            chi=chi,
+        )
+        reference_drift_speed = face_drift_velocity(
+            face_midpoints=reference_graph["shared_face_midpoints"],
+            face_normals=reference_graph["shared_face_normals"],
+            chemo_metadata=chemo_metadata,
+            chi=chi,
+        )
+        rollout, interface_flux_transport = generate_rollouts(
+            refined_density0=reference_density0,
+            refined_areas=mesh["reference_areas"],
+            coarse_parent=mesh["reference_parent"],
+            coarse_areas=mesh["areas"],
+            coarse_undirected_edges=graph["undirected_edge_index"],
+            undirected_edges=reference_graph["undirected_edge_index"],
+            shared_face_lengths=reference_graph["shared_face_lengths"],
+            centers=mesh["reference_centers"],
+            face_midpoints=reference_graph["shared_face_midpoints"],
+            face_normals=reference_graph["shared_face_normals"],
+            center_normal_distances=reference_graph["center_normal_distances"],
+            drift_speed=reference_drift_speed,
+            diffusion=args.diffusion,
+            solver_dt=solver_dt,
+            window=args.window,
+            substeps_per_frame=reference_substeps_per_frame,
+            progress_every=0,
+        )
+        max_flux_balance_error, max_mass_error = validate_single_trajectory(
+            rollout=rollout,
+            interface_flux_transport=interface_flux_transport,
+            areas=mesh["areas"],
+            undirected_edge_index=graph["undirected_edge_index"],
+        )
+        drift_velocity = chi[:, None, None] * chemo_gradient
+        metadata = build_dataset_metadata(
+            args=args,
+            trajectory_chi=chi,
+            chi_sampling=chi_sampling,
+            chi_distribution_min=chi_distribution_min,
+            chi_distribution_max=chi_distribution_max,
+            vertices=mesh["vertices"],
+            triangles=mesh["triangles"],
+            areas=mesh["areas"],
+            graph=graph,
+            reference_vertices=mesh["reference_vertices"],
+            reference_triangles=mesh["reference_triangles"],
+            coarse_stable_dt=float(coarse_stable_steps[trajectory]),
+            reference_stable_dt=float(reference_stable_steps[trajectory]),
+            nominal_coarse_dt=nominal_coarse_dt,
+            solver_dt=solver_dt,
+            reference_substeps_per_frame=reference_substeps_per_frame,
+            frame_dt=frame_dt,
+            rollout=rollout,
+            coarse_trajectory_max_rates=coarse_max_rates[trajectory : trajectory + 1],
+            reference_trajectory_max_rates=(
+                reference_max_rates[trajectory : trajectory + 1]
+            ),
+            max_flux_balance_error=max_flux_balance_error,
+            max_mass_error=max_mass_error,
+            chemo_metadata=chemo_metadata,
+            density_metadata=density_metadata,
+            extra_metadata={
+                "generation_layout": "one_trajectory_per_file",
+                "global_trajectory_id": int(trajectory),
+                "collection_num_trajectories": int(args.num_samples),
+                "collection_num_unique_meshes": int(
+                    1 if args.shared_mesh else args.num_samples
+                ),
+                "collection_num_unique_chemoattractant_landscapes": int(
+                    1 if args.shared_chemoattractant else args.num_samples
+                ),
+                "collection_coarse_solver_dt_stability_limit": (
+                    collection_coarse_stable_dt
+                ),
+                "collection_reference_solver_dt_stability_limit": (
+                    collection_reference_stable_dt
+                ),
+            },
+        )
+        output_path = trajectory_output_path(args.out, trajectory, args.num_samples)
+        save_dataset(
+            out_path=output_path,
+            rollout=rollout,
+            interface_flux_transport=interface_flux_transport,
+            chemo=chemo,
+            chemo_gradient=chemo_gradient,
+            drift_velocity=drift_velocity,
+            face_drift_speed=coarse_drift_speed,
+            vertices=mesh["vertices"],
+            triangles=mesh["triangles"],
+            centers=mesh["centers"],
+            areas=mesh["areas"],
+            graph=graph,
+            frame_dt=frame_dt,
+            target_type=args.target_type,
+            metadata=metadata,
+        )
+        completed = trajectory + 1
+        if args.progress_every > 0 and (
+            completed % args.progress_every == 0 or completed == args.num_samples
+        ):
+            previous_report_at = print_progress(
+                stage="Generated and saved trajectories",
+                completed=completed,
+                total=args.num_samples,
+                stage_started_at=trajectories_started_at,
+                previous_report_at=previous_report_at,
+            )
+
+    print("Generated sharded chemotactic cell-migration dataset")
+    print(f"  trajectory files: {args.num_samples}")
+    print(f"  first file: {first_output}")
+    print(f"  last file: {last_output}")
+    print(f"  total generation time: {time.perf_counter() - generation_started_at:.1f}s")
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -1459,6 +2103,25 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default="increment",
         help="Contents of y.",
     )
+    parser.add_argument(
+        "--one-trajectory-at-a-time",
+        action="store_true",
+        help=(
+            "Generate, validate, and save one trajectory at a time. Each output "
+            "is named OUT_DIR/trajectory_NNNNN.npz; a .npz suffix is removed from "
+            "OUT to obtain OUT_DIR, and no combined archive is written."
+        ),
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=10,
+        metavar="N",
+        help=(
+            "Print elapsed-time progress every N trajectories or rollout frames; "
+            "use 0 to disable progress output (default: 10)."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=1234, help="Random seed.")
     parser.add_argument("--out", type=Path, required=True, help="Output .npz path.")
     return parser.parse_args(argv)
@@ -1472,6 +2135,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         raise ValueError("substeps_per_frame must be positive.")
     if args.reference_refinement_levels < 0:
         raise ValueError("reference_refinement_levels must be nonnegative.")
+    if args.progress_every < 0:
+        raise ValueError("progress_every must be nonnegative.")
     if not (0.0 < args.reference_cfl <= 1.0):
         raise ValueError("reference_cfl must be in (0, 1].")
     if args.chi_range is None:
@@ -1490,7 +2155,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "mesh_jitter must be positive when num_samples > 1 so every "
             "trajectory can have unique geometry."
         )
+    if args.one_trajectory_at_a_time:
+        generate_trajectory_shards(args)
+        return
 
+    generation_started_at = time.perf_counter()
     rng = np.random.default_rng(args.seed)
     if args.chi_range is None:
         trajectory_chi = np.full(args.num_samples, args.chi, dtype=np.float64)
@@ -1518,6 +2187,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     reference_parents_list = []
     reference_graphs = []
     mesh_signatures = set()
+    meshes_started_at = time.perf_counter()
+    previous_mesh_report_at = meshes_started_at
 
     for sample in range(args.num_samples):
         if sample > 0 and args.shared_mesh:
@@ -1609,6 +2280,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         reference_quadrature_list.append(reference_quadrature_sample)
         reference_parents_list.append(reference_parent_sample)
         reference_graphs.append(reference_graph_sample)
+        completed = sample + 1
+        if args.progress_every > 0 and (
+            completed % args.progress_every == 0 or completed == args.num_samples
+        ):
+            previous_mesh_report_at = print_progress(
+                stage="Prepared trajectory meshes",
+                completed=completed,
+                total=args.num_samples,
+                stage_started_at=meshes_started_at,
+                previous_report_at=previous_mesh_report_at,
+            )
 
     vertices = np.stack(vertices_list, axis=0)
     triangles = np.stack(triangles_list, axis=0)
@@ -1723,8 +2405,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         solver_dt=solver_dt,
         window=args.window,
         substeps_per_frame=reference_substeps_per_frame,
+        progress_every=args.progress_every,
     )
     flux_implied_mass_change = np.zeros_like(rollout[:, 1:])
+    validation_started_at = time.perf_counter()
+    previous_validation_report_at = validation_started_at
     for sample in range(args.num_samples):
         cell_i, cell_j = graph["undirected_edge_index"][sample]
         for frame in range(args.window):
@@ -1737,6 +2422,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 flux_implied_mass_change[sample, frame],
                 cell_j,
                 interface_flux_transport[sample, frame],
+            )
+        completed = sample + 1
+        if args.progress_every > 0 and (
+            completed % args.progress_every == 0 or completed == args.num_samples
+        ):
+            previous_validation_report_at = print_progress(
+                stage="Validated trajectory flux balances",
+                completed=completed,
+                total=args.num_samples,
+                stage_started_at=validation_started_at,
+                previous_report_at=previous_validation_report_at,
             )
     observed_mass_change = (rollout[:, 1:] - rollout[:, :-1]) * areas[:, None, :]
     max_flux_balance_error = float(
@@ -1758,115 +2454,32 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
     drift_velocity = trajectory_chi[:, None, None] * chemo_gradient
 
-    edge_attr_columns = (
-        "delta_x,delta_y,distance,unit_x,unit_y,shared_face_length,"
-        "face_normal_x,face_normal_y,center_normal_distance,transmissibility,"
-        "source_cell_area,target_cell_area,"
-        "source_is_boundary_cell"
+    metadata = build_dataset_metadata(
+        args=args,
+        trajectory_chi=trajectory_chi,
+        chi_sampling=chi_sampling,
+        chi_distribution_min=chi_distribution_min,
+        chi_distribution_max=chi_distribution_max,
+        vertices=vertices,
+        triangles=triangles,
+        areas=areas,
+        graph=graph,
+        reference_vertices=reference_vertices,
+        reference_triangles=reference_triangles,
+        coarse_stable_dt=coarse_stable_dt,
+        reference_stable_dt=reference_stable_dt,
+        nominal_coarse_dt=nominal_coarse_dt,
+        solver_dt=solver_dt,
+        reference_substeps_per_frame=reference_substeps_per_frame,
+        frame_dt=frame_dt,
+        rollout=rollout,
+        coarse_trajectory_max_rates=coarse_trajectory_max_rates,
+        reference_trajectory_max_rates=reference_trajectory_max_rates,
+        max_flux_balance_error=max_flux_balance_error,
+        max_mass_error=max_mass_error,
+        chemo_metadata=chemo_metadata,
+        density_metadata=density_metadata,
     )
-    metadata: Dict[str, object] = {
-        "model": "prescribed_chemoattractant_drift_diffusion",
-        "equation": "n_t + div(chi*n*grad(c) - D*grad(n)) = 0",
-        "boundary": "no_flux",
-        "state_representation": "triangle_cell_average",
-        "chemoattractant_evolution": "prescribed_static_in_time",
-        "chemoattractant_landscape": (
-            "shared_across_trajectories"
-            if args.shared_chemoattractant
-            else "unique_per_trajectory"
-        ),
-        "num_unique_chemoattractant_landscapes": int(
-            1 if args.shared_chemoattractant else args.num_samples
-        ),
-        "mesh_geometry": (
-            "shared_across_trajectories_static_in_time"
-            if args.shared_mesh
-            else "unique_per_trajectory_static_in_time"
-        ),
-        "num_unique_meshes": int(1 if args.shared_mesh else args.num_samples),
-        "mesh_mode": str(args.mesh_mode),
-        "mesh_jitter": float(args.mesh_jitter),
-        "nx": int(args.nx),
-        "ny": int(args.ny),
-        "num_mesh_vertices": int(vertices.shape[1]),
-        "num_cells": int(triangles.shape[1]),
-        "num_undirected_edges": int(graph["undirected_edge_index"].shape[2]),
-        "num_boundary_faces": int(graph["boundary_faces"].shape[1]),
-        "lx": float(args.lx),
-        "ly": float(args.ly),
-        "domain_area": domain_area,
-        "cell_area_min": float(np.min(areas)),
-        "cell_area_mean": float(np.mean(areas)),
-        "cell_area_max": float(np.max(areas)),
-        "diffusion": float(args.diffusion),
-        "chi": trajectory_chi,
-        "chi_sampling": chi_sampling,
-        "chi_shared_across_trajectories": bool(
-            np.all(trajectory_chi == trajectory_chi[0])
-        ),
-        "num_unique_chi_values": int(np.unique(trajectory_chi).size),
-        "chi_min": chi_distribution_min,
-        "chi_max": chi_distribution_max,
-        "chi_sample_min": float(np.min(trajectory_chi)),
-        "chi_sample_max": float(np.max(trajectory_chi)),
-        "CFL": float(args.CFL),
-        "reference_CFL": float(args.reference_cfl),
-        "coarse_solver_dt_stability_limit": float(coarse_stable_dt),
-        "reference_solver_dt_stability_limit": float(reference_stable_dt),
-        "solver_dt_stability_limit": float(reference_stable_dt),
-        "nominal_coarse_solver_dt": float(nominal_coarse_dt),
-        "solver_dt": float(solver_dt),
-        "requested_substeps_per_frame": int(args.substeps_per_frame),
-        "substeps_per_frame": int(reference_substeps_per_frame),
-        "dt": float(frame_dt),
-        "reference_refinement_levels": int(args.reference_refinement_levels),
-        "reference_num_mesh_vertices": int(reference_vertices.shape[1]),
-        "reference_num_cells": int(reference_triangles.shape[1]),
-        "reference_spatial_scheme": (
-            "barth_jespersen_muscl_face_normal_nonorthogonal_finite_volume"
-        ),
-        "reference_time_integrator": "SSP_RK2",
-        "reference_projection": "sum_child_mass_divide_parent_area",
-        "interface_flux_reference": (
-            "integrated_refined_ssp_rk2_face_flux_aggregated_to_coarse_faces"
-        ),
-        "interface_flux_orientation": "undirected_edge_index_source_to_target",
-        "interface_flux_transport_units": "mass_per_stored_frame",
-        "interface_flux_rate_units": "mass_per_time",
-        "max_abs_interface_flux_balance_error": max_flux_balance_error,
-        "num_samples": int(args.num_samples),
-        "window": int(args.window),
-        "num_pairs": int(args.num_samples * args.window),
-        "target_type": str(args.target_type),
-        "x_columns": "cell_density,chemoattractant,drift_velocity_x,drift_velocity_y",
-        "edge_attr_columns": edge_attr_columns,
-        "seed": int(args.seed),
-        "chemo_sources_min": int(args.chemo_sources_min),
-        "chemo_sources_max": int(args.chemo_sources_max),
-        "chemo_amplitude_min": float(args.chemo_amplitude_min),
-        "chemo_amplitude_max": float(args.chemo_amplitude_max),
-        "chemo_sigma_min": float(args.chemo_sigma_min),
-        "chemo_sigma_max": float(args.chemo_sigma_max),
-        "chemo_baseline": float(args.chemo_baseline),
-        "source_margin_fraction": float(args.source_margin_fraction),
-        "density_blobs_min": int(args.density_blobs_min),
-        "density_blobs_max": int(args.density_blobs_max),
-        "density_amplitude_min": float(args.density_amplitude_min),
-        "density_amplitude_max": float(args.density_amplitude_max),
-        "density_sigma_min": float(args.density_sigma_min),
-        "density_sigma_max": float(args.density_sigma_max),
-        "density_background_min": float(args.density_background_min),
-        "density_background_max": float(args.density_background_max),
-        "density_margin_fraction": float(args.density_margin_fraction),
-        "primary_separation": float(args.primary_separation),
-        "trajectory_max_outgoing_rate": reference_trajectory_max_rates,
-        "coarse_trajectory_max_outgoing_rate": coarse_trajectory_max_rates,
-        "density_min_observed": minimum_density,
-        "density_max_observed": float(np.max(rollout)),
-        "max_abs_mass_error": max_mass_error,
-        **chemo_metadata,
-        **density_metadata,
-    }
     save_dataset(
         out_path=args.out,
         rollout=rollout,
@@ -1925,6 +2538,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     print(f"  density range: [{np.min(rollout):.8e}, {np.max(rollout):.8e}]")
     print(f"  max |mass(t)-mass(0)|: {max_mass_error:.8e}")
     print(f"  max interface-flux balance error: {max_flux_balance_error:.8e}")
+    print(f"  total generation time: {time.perf_counter() - generation_started_at:.1f}s")
 
 
 if __name__ == "__main__":

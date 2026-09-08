@@ -84,6 +84,11 @@ Example:
 
     python scripts/train.py --config config_chemotaxis_gnn.json
 
+``--data`` may name either one combined ``.npz`` archive or a directory of
+``trajectory_NNNNN.npz`` shards produced by the data generator. Directory
+inputs are reassembled in global trajectory order before the usual
+trajectory-disjoint train/validation/test split.
+
 Explicit command-line values override the JSON config:
 
     python scripts/train.py --config config_chemotaxis_gnn.json \
@@ -125,6 +130,7 @@ from physics_inputs import (
     face_drift_speed_from_archive,
     resolve_physics_input_cfg,
 )
+from chemotaxis_archive import load_archive, split_trajectories
 
 
 TARGET_TYPES = ("state", "delta", "rate")
@@ -168,143 +174,6 @@ def _scalar(array: np.ndarray, name: str) -> float:
     if value.ndim != 0:
         raise ValueError(f"{name} must be a scalar; got shape {value.shape}.")
     return float(value.item())
-
-
-def load_archive(path: Path) -> Dict[str, np.ndarray]:
-    """Load and validate the trajectory-specific chemotaxis graph archive."""
-    if not path.is_file():
-        raise FileNotFoundError(f"Dataset does not exist: {path}")
-    with np.load(path, allow_pickle=False) as archive:
-        data = {name: archive[name] for name in archive.files}
-
-    required = (
-        "rollout_states",
-        "chemoattractant",
-        "chi",
-        "dt",
-        "pos",
-        "cell_areas",
-        "boundary_cell_mask",
-        "edge_index",
-        "edge_attr",
-        "undirected_edge_index",
-    )
-    missing = [name for name in required if name not in data]
-    if missing:
-        raise KeyError("Dataset is missing required arrays: " + ", ".join(missing))
-
-    states = np.asarray(data["rollout_states"])
-    if states.ndim != 4 or states.shape[-1] != 1:
-        raise ValueError(
-            "rollout_states must have shape [trajectory, time, node, 1]."
-        )
-    num_trajectories, num_frames, num_nodes, _ = states.shape
-    if num_frames < 2:
-        raise ValueError("rollout_states must contain at least two frames.")
-
-    expected_node_shapes = {
-        "chemoattractant": (num_trajectories, num_nodes, 1),
-        "pos": (num_trajectories, num_nodes, 2),
-        "cell_areas": (num_trajectories, num_nodes),
-        "boundary_cell_mask": (num_trajectories, num_nodes),
-    }
-    for name, expected in expected_node_shapes.items():
-        if np.asarray(data[name]).shape != expected:
-            raise ValueError(
-                f"{name} has shape {np.asarray(data[name]).shape}; "
-                f"expected {expected}."
-            )
-
-    edge_index = np.asarray(data["edge_index"])
-    edge_attr = np.asarray(data["edge_attr"])
-    undirected = np.asarray(data["undirected_edge_index"])
-    if edge_index.ndim != 3 or edge_index.shape[0:2] != (num_trajectories, 2):
-        raise ValueError("edge_index must have shape [trajectory, 2, edge].")
-    if edge_attr.ndim != 3 or edge_attr.shape[:2] != (
-        num_trajectories,
-        edge_index.shape[2],
-    ):
-        raise ValueError(
-            "edge_attr must have shape [trajectory, edge, channel] and align "
-            "with edge_index."
-        )
-    if undirected.ndim != 3 or undirected.shape[0:2] != (num_trajectories, 2):
-        raise ValueError(
-            "undirected_edge_index must have shape [trajectory, 2, face]."
-        )
-    num_faces = undirected.shape[2]
-    if edge_index.shape[2] != 2 * num_faces:
-        raise ValueError(
-            "Expected exactly two directed graph edges per interior face."
-        )
-    if not np.array_equal(edge_index[:, :, :num_faces], undirected):
-        raise ValueError(
-            "The first half of edge_index must match undirected_edge_index."
-        )
-    if not np.array_equal(
-        edge_index[:, :, num_faces:], undirected[:, ::-1, :]
-    ):
-        raise ValueError(
-            "The second half of edge_index must contain reversed interior edges."
-        )
-    if np.any(np.asarray(data["cell_areas"]) <= 0.0):
-        raise ValueError("Every cell area must be positive.")
-    if not np.all(np.isfinite(states)):
-        raise ValueError("rollout_states contains non-finite values.")
-    if _scalar(data["dt"], "dt") <= 0.0:
-        raise ValueError("dt must be positive.")
-
-    chi = np.asarray(data["chi"], dtype=np.float64)
-    if chi.ndim == 0:
-        chi = np.full(num_trajectories, float(chi), dtype=np.float64)
-    if chi.shape != (num_trajectories,):
-        raise ValueError(
-            f"chi must be scalar or shape [{num_trajectories}]; got {chi.shape}."
-        )
-    if np.any(chi < 0.0) or not np.all(np.isfinite(chi)):
-        raise ValueError("chi values must be finite and nonnegative.")
-    data["trajectory_chi"] = chi
-    return data
-
-
-def split_trajectories(
-    num_trajectories: int,
-    *,
-    train_fraction: float,
-    validation_fraction: float,
-    test_fraction: float,
-    seed: int,
-) -> Dict[str, np.ndarray]:
-    """Create deterministic, mutually exclusive trajectory splits."""
-    fractions = np.asarray(
-        [train_fraction, validation_fraction, test_fraction], dtype=np.float64
-    )
-    if np.any(fractions <= 0.0) or not np.isclose(fractions.sum(), 1.0):
-        raise ValueError(
-            "train_fraction, validation_fraction, and test_fraction must be "
-            "positive and sum to one."
-        )
-    if num_trajectories < 3:
-        raise ValueError("At least three trajectories are required for three splits.")
-
-    order = np.random.default_rng(seed).permutation(num_trajectories)
-    train_count = max(1, int(np.floor(train_fraction * num_trajectories)))
-    validation_count = max(
-        1, int(np.floor(validation_fraction * num_trajectories))
-    )
-    if train_count + validation_count >= num_trajectories:
-        validation_count = 1
-        train_count = num_trajectories - 2
-    test_count = num_trajectories - train_count - validation_count
-    if min(train_count, validation_count, test_count) <= 0:
-        raise ValueError("The requested fractions produced an empty split.")
-    return {
-        "train": np.sort(order[:train_count]),
-        "validation": np.sort(
-            order[train_count : train_count + validation_count]
-        ),
-        "test": np.sort(order[train_count + validation_count :]),
-    }
 
 
 def static_continuous_feature_names(
@@ -1783,6 +1652,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--data",
         type=Path,
         default=Path("data/rollout/chemotaxis_varying-Chi.npz"),
+        help="Combined dataset .npz or directory of per-trajectory .npz shards.",
     )
     parser.add_argument(
         "--output", type=Path, default=Path("runs/chemotaxis/sageconv")
