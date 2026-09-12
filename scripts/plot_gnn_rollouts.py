@@ -24,6 +24,7 @@ import csv
 import json
 import os
 import tempfile
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -39,6 +40,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 import numpy as np
+
+from generate_chemotactic_cell_migration_data import (
+    gaussian_mixture_value_and_gradient,
+)
 
 try:
     import torch
@@ -58,6 +63,34 @@ from train import (
     prepare_features,
     project_conservative_target,
 )
+from physics_inputs import (
+    PhysicsInputConfig,
+    build_physics_augmented_inputs_2d,
+    count_physics_input_channels,
+    face_drift_speed_from_archive,
+    resolve_physics_input_cfg,
+)
+
+
+CHEMO_CONTOUR_METHOD_AUTO = "auto"
+CHEMO_CONTOUR_METHOD_ANALYTIC = "analytic-grid"
+CHEMO_CONTOUR_METHOD_TRIANGULATION = "cell-triangulation"
+CHEMO_CONTOUR_METHODS = (
+    CHEMO_CONTOUR_METHOD_AUTO,
+    CHEMO_CONTOUR_METHOD_ANALYTIC,
+    CHEMO_CONTOUR_METHOD_TRIANGULATION,
+)
+
+
+@dataclass(frozen=True)
+class ChemoContourField:
+    """Static chemoattractant field prepared for one contour renderer."""
+
+    method: str
+    values: np.ndarray
+    x: Optional[np.ndarray] = None
+    y: Optional[np.ndarray] = None
+    triangulation: Optional[mtri.Triangulation] = None
 
 
 def load_checkpoint(path: Path) -> Dict[str, object]:
@@ -113,6 +146,7 @@ def predict_rollouts(
     include_drift_velocity: bool,
     include_absolute_positions: bool,
     include_boundary_distances: bool,
+    physics_cfg: PhysicsInputConfig,
 ) -> np.ndarray:
     """Autoregressively predict selected trajectory-specific graphs."""
     static, edge_attr, undirected_edge_attr = prepare_features(
@@ -127,8 +161,25 @@ def predict_rollouts(
     edge_indices = np.asarray(data["edge_index"], dtype=np.int64)
     face_indices = np.asarray(data["undirected_edge_index"], dtype=np.int64)
     areas = np.asarray(data["cell_areas"], dtype=np.float32)
+    face_drift_speed = None
+    shared_face_lengths = None
+    if count_physics_input_channels(physics_cfg):
+        face_drift_speed = face_drift_speed_from_archive(data)
+        if "shared_face_lengths" not in data:
+            raise KeyError(
+                "Advection inputs require shared_face_lengths in the dataset."
+            )
+        shared_face_lengths = np.asarray(
+            data["shared_face_lengths"], dtype=np.float32
+        )
     dt = float(np.asarray(data["dt"]).item())
     num_nodes = states.shape[2]
+    num_directed_edges = edge_indices.shape[2]
+    num_faces = face_indices.shape[2]
+    if num_directed_edges != 2 * num_faces:
+        raise ValueError(
+            "Expected exactly two directed edges per undirected interior face."
+        )
     predictions: List[np.ndarray] = []
 
     for first in range(0, trajectory_ids.size, batch_size):
@@ -141,9 +192,23 @@ def predict_rollouts(
         directed_attr = torch.from_numpy(edge_attr[ids]).to(device=device).reshape(
             -1, edge_attr.shape[-1]
         )
+        forward_face_edge_mask = (
+            torch.arange(count * num_directed_edges, device=device)
+            % num_directed_edges
+            < num_faces
+        )
         face_attr = torch.from_numpy(undirected_edge_attr[ids]).to(
             device=device
         ).reshape(-1, undirected_edge_attr.shape[-1])
+        face_speed = None
+        face_length = None
+        if face_drift_speed is not None and shared_face_lengths is not None:
+            face_speed = torch.from_numpy(face_drift_speed[ids]).to(
+                device=device
+            ).reshape(-1, 1)
+            face_length = torch.from_numpy(shared_face_lengths[ids]).to(
+                device=device
+            ).reshape(-1, 1)
         cell_area = torch.from_numpy(areas[ids, :, None]).to(device=device).reshape(
             -1, 1
         )
@@ -153,17 +218,36 @@ def predict_rollouts(
         ).repeat_interleave(num_nodes)
         predicted = [current]
 
-        for _ in range(num_steps):
+        for step in range(num_steps):
             normalized_density = (
                 current - normalization.density_mean
             ) / normalization.density_std
-            node_input = torch.cat((normalized_density, static_batch), dim=-1)
+            base_input = torch.cat(
+                (normalized_density, static_batch), dim=-1
+            ).reshape(count * num_nodes, -1)
+            if count_physics_input_channels(physics_cfg):
+                if face_speed is None or face_length is None:
+                    raise RuntimeError("Advection face data is unavailable.")
+                node_input = build_physics_augmented_inputs_2d(
+                    x_base=base_input,
+                    x_state=current.reshape(-1, 1),
+                    undirected_edge_index=face_index,
+                    face_drift_speed=face_speed,
+                    shared_face_length=face_length,
+                    cell_area=cell_area,
+                    dt_node=dt_node,
+                    physics_cfg=physics_cfg,
+                    step_k=step,
+                )
+            else:
+                node_input = base_input
             normalized_target = model(
-                node_input.reshape(count * num_nodes, -1),
+                node_input,
                 directed_index,
                 edge_attr=directed_attr,
                 undirected_edge_index=face_index,
                 undirected_edge_attr=face_attr,
+                forward_face_edge_mask=forward_face_edge_mask,
                 cell_area=cell_area,
                 current=current.reshape(-1, 1),
             )
@@ -311,35 +395,153 @@ def cell_center_triangulation(
     return mtri.Triangulation(centers[:, 0], centers[:, 1])
 
 
+def resolve_chemo_contour_method(
+    data: Dict[str, np.ndarray], requested_method: str
+) -> str:
+    """Select analytical contours when their source metadata is available."""
+    if requested_method not in CHEMO_CONTOUR_METHODS:
+        raise ValueError(
+            "chemo contour method must be one of "
+            + ", ".join(CHEMO_CONTOUR_METHODS)
+        )
+    analytic_keys = (
+        "chemo_source_count",
+        "chemo_source_centers",
+        "chemo_source_amplitudes",
+        "chemo_source_sigmas",
+    )
+    missing = [key for key in analytic_keys if key not in data]
+    if requested_method == CHEMO_CONTOUR_METHOD_AUTO:
+        return (
+            CHEMO_CONTOUR_METHOD_ANALYTIC
+            if not missing
+            else CHEMO_CONTOUR_METHOD_TRIANGULATION
+        )
+    if requested_method == CHEMO_CONTOUR_METHOD_ANALYTIC and missing:
+        raise KeyError(
+            "Analytical chemoattractant contours require dataset fields: "
+            + ", ".join(missing)
+        )
+    return requested_method
+
+
+def prepare_chemo_contour_field(
+    data: Dict[str, np.ndarray],
+    trajectory: int,
+    mesh: mtri.Triangulation,
+    *,
+    method: str,
+    resolution: int,
+) -> ChemoContourField:
+    """Prepare either an exact Gaussian grid or the legacy cell triangulation."""
+    resolved_method = resolve_chemo_contour_method(data, method)
+    if resolved_method == CHEMO_CONTOUR_METHOD_TRIANGULATION:
+        values = np.asarray(
+            data["chemoattractant"][trajectory], dtype=np.float64
+        )
+        if values.ndim == 2 and values.shape[1] == 1:
+            values = values[:, 0]
+        if values.ndim != 1:
+            raise ValueError(
+                "chemoattractant must have shape [trajectory, cell, 1] "
+                "or [trajectory, cell]."
+            )
+        return ChemoContourField(
+            method=resolved_method,
+            values=values,
+            triangulation=cell_center_triangulation(data, trajectory),
+        )
+
+    if resolution < 2:
+        raise ValueError("Analytical contour resolution must be at least 2.")
+    count = int(np.asarray(data["chemo_source_count"])[trajectory])
+    centers = np.asarray(
+        data["chemo_source_centers"][trajectory], dtype=np.float64
+    )
+    amplitudes = np.asarray(
+        data["chemo_source_amplitudes"][trajectory], dtype=np.float64
+    )
+    sigmas = np.asarray(
+        data["chemo_source_sigmas"][trajectory], dtype=np.float64
+    )
+    if count <= 0 or count > centers.shape[0]:
+        raise ValueError("chemo_source_count is inconsistent with source arrays.")
+    centers = centers[:count]
+    amplitudes = amplitudes[:count]
+    sigmas = sigmas[:count]
+    if (
+        centers.shape != (count, 2)
+        or amplitudes.shape != (count,)
+        or sigmas.shape != (count,)
+        or not np.all(np.isfinite(centers))
+        or not np.all(np.isfinite(amplitudes))
+        or not np.all(np.isfinite(sigmas))
+        or np.any(sigmas <= 0.0)
+    ):
+        raise ValueError("Invalid Gaussian chemoattractant source metadata.")
+    baseline_array = np.asarray(data.get("chemo_baseline", 0.0), dtype=np.float64)
+    if baseline_array.size != 1 or not np.all(np.isfinite(baseline_array)):
+        raise ValueError("chemo_baseline must be a finite scalar.")
+    x = np.linspace(float(np.min(mesh.x)), float(np.max(mesh.x)), resolution)
+    y = np.linspace(float(np.min(mesh.y)), float(np.max(mesh.y)), resolution)
+    grid_x, grid_y = np.meshgrid(x, y)
+    points = np.column_stack((grid_x.ravel(), grid_y.ravel()))
+    values, _ = gaussian_mixture_value_and_gradient(
+        points=points,
+        centers=centers,
+        amplitudes=amplitudes,
+        sigmas=sigmas,
+        baseline=float(baseline_array.item()),
+    )
+    return ChemoContourField(
+        method=resolved_method,
+        values=values.reshape(grid_x.shape),
+        x=x,
+        y=y,
+    )
+
+
 def overlay_chemoattractant_contours(
     axis: plt.Axes,
-    contour_mesh: mtri.Triangulation,
-    chemoattractant: np.ndarray,
+    field: ChemoContourField,
     *,
     num_levels: int,
     alpha: float,
 ) -> None:
     """Overlay high-contrast contours of the static chemoattractant field."""
-    lower = float(np.min(chemoattractant))
-    upper = float(np.max(chemoattractant))
+    lower = float(np.min(field.values))
+    upper = float(np.max(field.values))
     if not np.isfinite(lower) or not np.isfinite(upper) or upper <= lower:
         return
     levels = np.linspace(lower, upper, num_levels + 2, dtype=np.float64)[1:-1]
+    if field.method == CHEMO_CONTOUR_METHOD_ANALYTIC:
+        if field.x is None or field.y is None:
+            raise RuntimeError("Analytical contour field has no grid coordinates.")
+
+        def draw_contours(**kwargs: object) -> None:
+            axis.contour(field.x, field.y, field.values, levels=levels, **kwargs)
+
+    else:
+        if field.triangulation is None:
+            raise RuntimeError("Triangulated contour field has no triangulation.")
+
+        def draw_contours(**kwargs: object) -> None:
+            axis.tricontour(
+                field.triangulation,
+                field.values,
+                levels=levels,
+                **kwargs,
+            )
+
     # A dark underlay keeps the white contours visible on both light and dark
     # regions of the density colormap.
-    axis.tricontour(
-        contour_mesh,
-        chemoattractant,
-        levels=levels,
+    draw_contours(
         colors="black",
         linewidths=1.5,
         alpha=0.45 * alpha,
         zorder=3,
     )
-    axis.tricontour(
-        contour_mesh,
-        chemoattractant,
-        levels=levels,
+    draw_contours(
         colors="white",
         linewidths=0.75,
         alpha=alpha,
@@ -347,9 +549,13 @@ def overlay_chemoattractant_contours(
     )
 
 
-def _style_spatial_axis(axis: plt.Axes) -> None:
-    axis.set_aspect("equal")
-    axis.set_xlim(0.0, float(np.asarray(axis.get_xlim()).max()))
+def _style_spatial_axis(
+    axis: plt.Axes, mesh: mtri.Triangulation
+) -> None:
+    """Use the exact mesh domain without Matplotlib's autoscale padding."""
+    axis.set_aspect("equal", adjustable="box")
+    axis.set_xlim(float(np.min(mesh.x)), float(np.max(mesh.x)))
+    axis.set_ylim(float(np.min(mesh.y)), float(np.max(mesh.y)))
     axis.set_xticks([])
     axis.set_yticks([])
 
@@ -369,36 +575,57 @@ def plot_spatial_comparison(
     chemo_contours: bool,
     chemo_contour_levels: int,
     chemo_contour_alpha: float,
+    chemo_contour_method: str = CHEMO_CONTOUR_METHOD_AUTO,
+    chemo_contour_resolution: int = 300,
+    spatial_time_axis: str = "rows",
 ) -> None:
     """Plot truth, prediction, error, and optional chemoattractant contours."""
+    if spatial_time_axis not in ("rows", "columns"):
+        raise ValueError("spatial_time_axis must be 'rows' or 'columns'.")
     mesh = triangulation(data, trajectory)
-    contour_mesh = None
-    chemoattractant = None
+    contour_field = None
     if chemo_contours:
-        contour_mesh = cell_center_triangulation(data, trajectory)
-        chemoattractant = np.asarray(
-            data["chemoattractant"][trajectory, :, 0], dtype=np.float64
+        contour_field = prepare_chemo_contour_field(
+            data,
+            trajectory,
+            mesh,
+            method=chemo_contour_method,
+            resolution=chemo_contour_resolution,
         )
     error = prediction - truth
     steps = np.asarray(snapshot_steps, dtype=np.int64)
     density_min = float(min(np.min(truth[steps]), np.min(prediction[steps])))
     density_max = float(max(np.max(truth[steps]), np.max(prediction[steps])))
     error_limit = max(float(np.max(np.abs(error[steps]))), 1.0e-10)
+    if spatial_time_axis == "rows":
+        num_rows, num_columns = len(steps), 3
+        figure_size = (11.5, 3.15 * len(steps))
+    else:
+        num_rows, num_columns = 3, len(steps)
+        figure_size = (max(3.15 * len(steps), 7.0), 9.45)
     figure, axes = plt.subplots(
-        len(steps), 3, figsize=(11.5, 3.15 * len(steps)), squeeze=False,
+        num_rows,
+        num_columns,
+        figsize=figure_size,
+        squeeze=False,
         constrained_layout=True,
     )
     density_artist = None
     error_artist = None
-    for row, step in enumerate(steps):
-        for column, (values, color_map, lower, upper) in enumerate(
+    for step_index, step in enumerate(steps):
+        for field_index, (values, color_map, lower, upper) in enumerate(
             (
                 (truth[step], cmap, density_min, density_max),
                 (prediction[step], cmap, density_min, density_max),
                 (error[step], "coolwarm", -error_limit, error_limit),
             )
         ):
-            artist = axes[row, column].tripcolor(
+            axis = (
+                axes[step_index, field_index]
+                if spatial_time_axis == "rows"
+                else axes[field_index, step_index]
+            )
+            artist = axis.tripcolor(
                 mesh,
                 facecolors=values,
                 shading="flat",
@@ -407,37 +634,59 @@ def plot_spatial_comparison(
                 vmax=upper,
                 edgecolors="none",
             )
-            if column < 2 and contour_mesh is not None and chemoattractant is not None:
+            if (
+                field_index < 2
+                and contour_field is not None
+            ):
                 overlay_chemoattractant_contours(
-                    axes[row, column],
-                    contour_mesh,
-                    chemoattractant,
+                    axis,
+                    contour_field,
                     num_levels=chemo_contour_levels,
                     alpha=chemo_contour_alpha,
                 )
-            _style_spatial_axis(axes[row, column])
-            if column < 2:
+            _style_spatial_axis(axis, mesh)
+            if field_index < 2:
                 density_artist = artist
             else:
                 error_artist = artist
-        axes[row, 0].set_ylabel(f"step {step}\nt={step * dt:.4g}")
-    axes[0, 0].set_title("Ground truth")
-    axes[0, 1].set_title(f"{model_label} prediction")
-    axes[0, 2].set_title("Prediction − truth")
+    if spatial_time_axis == "rows":
+        for row, step in enumerate(steps):
+            axes[row, 0].set_ylabel(
+                f"Step {step}\nt={step * dt:.4g}", fontsize=18
+            )
+        axes[0, 0].set_title("Ground Truth", fontsize=20)
+        #axes[0, 1].set_title(f"{model_label} prediction", fontsize=20)
+        axes[0, 1].set_title("GNN Prediction", fontsize=20)
+        axes[0, 2].set_title("Prediction − Truth", fontsize=20)
+        density_axes = list(axes[:, :2].ravel())
+        error_axes = list(axes[:, 2])
+    else:
+        for column, step in enumerate(steps):
+            axes[0, column].set_title(
+                f"Step {step}\nt={step * dt:.4g}", fontsize=16
+            )
+        axes[0, 0].set_ylabel("Ground Truth", fontsize=16)
+        axes[1, 0].set_ylabel("GNN Prediction", fontsize=16)
+        axes[2, 0].set_ylabel("Prediction − Truth", fontsize=16)
+        density_axes = list(axes[:2, :].ravel())
+        error_axes = list(axes[2, :])
     if density_artist is not None:
         colorbar = figure.colorbar(
-            density_artist, ax=list(axes[:, :2].ravel()), shrink=0.86, pad=0.015
+            density_artist, ax=density_axes, shrink=0.86, pad=0.015
         )
-        colorbar.set_label("Cell density")
+        colorbar.set_label("Cell density", fontsize=18)
+        colorbar.ax.tick_params(labelsize=14)
     if error_artist is not None:
         colorbar = figure.colorbar(
-            error_artist, ax=list(axes[:, 2]), shrink=0.86, pad=0.015
+            error_artist, ax=error_axes, shrink=0.86, pad=0.015
         )
-        colorbar.set_label("Density error")
-    title = f"Held-out trajectory {trajectory}: autoregressive rollout"
-    if chemo_contours:
-        title += "\nWhite contours show chemoattractant concentration c"
-    figure.suptitle(title)
+        colorbar.set_label("Density error", fontsize=18)
+        colorbar.ax.tick_params(labelsize=14)
+    #title = f"Held-out trajectory {trajectory}: Autoregressive Rollout"
+    title = f"Chemotactic Cell Migration: Autoregressive Rollout"
+    #if chemo_contours:
+    #    title += "\nWhite contours show chemoattractant concentration c"
+    figure.suptitle(title, fontsize=25)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close(figure)
@@ -733,6 +982,21 @@ def checkpoint_feature_options(
     return options
 
 
+def checkpoint_physics_input_config(
+    checkpoint: Dict[str, object],
+) -> PhysicsInputConfig:
+    """Recover resolved advection settings with legacy disabled defaults."""
+    stored = checkpoint.get("physics_inputs")
+    if stored is None:
+        training_args = checkpoint.get("training_args", {})
+        stored = (
+            training_args.get("physics_inputs", {})
+            if isinstance(training_args, dict)
+            else {}
+        )
+    return resolve_physics_input_cfg({"physics_inputs": stored})
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate and plot held-out autoregressive GNN rollouts."
@@ -758,6 +1022,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     selection.add_argument("--trajectories", nargs="+", type=int)
     selection.add_argument("--all-test", action="store_true")
     parser.add_argument("--snapshot-steps", nargs="+", type=int, default=None)
+    parser.add_argument(
+        "--spatial-time-axis",
+        choices=("rows", "columns"),
+        default="rows",
+        help=(
+            "Arrange spatial-rollout time steps as rows (default) or columns."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
     parser.add_argument("--dpi", type=int, default=180)
@@ -776,6 +1048,25 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Disable chemoattractant contour overlays.",
     )
     parser.set_defaults(chemo_contours=True)
+    parser.add_argument(
+        "--chemo-contour-method",
+        choices=CHEMO_CONTOUR_METHODS,
+        default=CHEMO_CONTOUR_METHOD_AUTO,
+        help=(
+            "Contour renderer. 'auto' uses the analytical Gaussian field "
+            "when source metadata exists and otherwise uses the legacy "
+            "cell-center triangulation (default: auto)."
+        ),
+    )
+    parser.add_argument(
+        "--chemo-contour-resolution",
+        type=int,
+        default=300,
+        help=(
+            "Points per coordinate direction for analytical contours "
+            "(default: 300)."
+        ),
+    )
     parser.add_argument(
         "--chemo-contour-levels",
         type=int,
@@ -799,6 +1090,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         raise ValueError("--batch-size and --dpi must be positive.")
     if args.chemo_contour_levels <= 0:
         raise ValueError("--chemo-contour-levels must be positive.")
+    if args.chemo_contour_resolution < 2:
+        raise ValueError("--chemo-contour-resolution must be at least 2.")
     if not (0.0 <= args.chemo_contour_alpha <= 1.0):
         raise ValueError("--chemo-contour-alpha must be in [0, 1].")
 
@@ -816,6 +1109,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     data = load_archive(data_path)
+    resolved_chemo_contour_method = (
+        resolve_chemo_contour_method(data, args.chemo_contour_method)
+        if args.chemo_contours
+        else "disabled"
+    )
     states = np.asarray(data["rollout_states"], dtype=np.float32)
     num_steps = states.shape[1] - 1 if args.rollout_steps is None else args.rollout_steps
     if num_steps > states.shape[1] - 1:
@@ -847,6 +1145,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
     model_label = str(checkpoint.get("model_name", type(model).__name__))
     feature_options = checkpoint_feature_options(checkpoint)
+    physics_cfg = checkpoint_physics_input_config(checkpoint)
 
     truth = states[test_ids, : num_steps + 1]
     prediction = predict_rollouts(
@@ -859,6 +1158,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         mass_projection=mass_projection,
         device=device,
         batch_size=args.batch_size,
+        physics_cfg=physics_cfg,
         **feature_options,
     )
     metrics = compute_metrics(
@@ -904,9 +1204,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "rollout_steps": int(num_steps),
             "mass_projection": bool(mass_projection),
             "chemo_contours": bool(args.chemo_contours),
+            "chemo_contour_method_requested": args.chemo_contour_method,
+            "chemo_contour_method": resolved_chemo_contour_method,
+            "chemo_contour_resolution": int(args.chemo_contour_resolution),
             "chemo_contour_levels": int(args.chemo_contour_levels),
             "chemo_contour_alpha": float(args.chemo_contour_alpha),
+            "spatial_time_axis": args.spatial_time_axis,
             **feature_options,
+            "physics_inputs": asdict(physics_cfg),
             "test_trajectories": int(test_ids.size),
         }
     )
@@ -939,6 +1244,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             chemo_contours=args.chemo_contours,
             chemo_contour_levels=args.chemo_contour_levels,
             chemo_contour_alpha=args.chemo_contour_alpha,
+            chemo_contour_method=resolved_chemo_contour_method,
+            chemo_contour_resolution=args.chemo_contour_resolution,
+            spatial_time_axis=args.spatial_time_axis,
         )
         plot_trajectory_diagnostics(
             truth[local, ..., 0],
@@ -961,6 +1269,19 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         f"drift_velocity={feature_options['include_drift_velocity']}, "
         f"absolute_positions={feature_options['include_absolute_positions']}, "
         f"boundary_distances={feature_options['include_boundary_distances']}"
+    )
+    print(
+        "physics inputs: "
+        f"enabled={physics_cfg.enabled}, include_adv={physics_cfg.include_adv}, "
+        f"input_form={physics_cfg.input_form}, "
+        f"advection_scheme={physics_cfg.advection_scheme}, "
+        f"adv_all_steps={physics_cfg.adv_all_steps}"
+    )
+    print(
+        "chemoattractant contours: "
+        f"enabled={args.chemo_contours}, "
+        f"method={resolved_chemo_contour_method}, "
+        f"resolution={args.chemo_contour_resolution}"
     )
     print(f"test trajectories: {test_ids.tolist()}")
     print(f"plotted trajectories: {selected}")
