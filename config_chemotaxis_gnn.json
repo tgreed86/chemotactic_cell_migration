@@ -1,6 +1,6 @@
 {
-  "data": "data/unique_meshes/chemotaxis_varying-Chi_flux_64x64.npz",
-  "output": "runs/multi-step/fluxgraphnet/with_advection/test",
+  "data": "data/varying-chi_0p05-to-0p2/unique_meshes_17x17/",
+  "output": "runs/multi-step/fluxgraphnet/updated_edge_features/test",
   "model": "fluxgraphnet",
   "target_type": "delta",
     "physics_inputs": {
@@ -38,7 +38,7 @@
   "num_layers": 4,
   "dropout": 0.1,
   "layer_norm": false,
-  "include_chi": false,
+  "include_chi": true,
   "include_drift_velocity": true,
   "include_absolute_positions": true,
   "include_boundary_distances": false,

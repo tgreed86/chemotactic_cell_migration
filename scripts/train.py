@@ -6,6 +6,19 @@ trajectory-disjoint train/validation/test splits, normalization learned only
 from the training split, JSON configuration with command-line overrides,
 early stopping, and a self-contained checkpoint.
 
+``early_stopping_metric`` selects the validation metric minimized for both
+patience and best-checkpoint selection (even when ``patience=0``). The default
+is ``normalized_mse``; ``rollout_state_rel_l2`` uses physical density error,
+independently of the training loss. For each graph and predicted rollout step,
+it computes ``sqrt(sum(area * error**2) / max(sum(area * truth**2), eps))``
+with ``eps=np.finfo(np.float64).eps``, then averages equally over graph/step
+pairs in the configured rollout windows (excluding their initial states).
+Other choices are ``objective_node_mse``, ``weighted_total_loss``,
+``next_state_rmse``, and ``mass_mae``. For example:
+
+    python scripts/train.py --config config_chemotaxis_gnn.json \
+        --early-stopping-metric rollout_state_rel_l2 --patience 50
+
 At every rollout step the core node features are density, chemoattractant,
 cell area, and a boundary flag. The prescribed drift velocity chi*grad(c),
 chemotactic sensitivity chi, absolute center coordinates, and four distances
@@ -137,6 +150,14 @@ TARGET_TYPES = ("state", "delta", "rate")
 MODEL_NAMES = ("sageconv", "meshgraphnet", "fluxgraphnet")
 NODE_LOSS_NORMALIZATIONS = ("density", "target")
 NODE_DENSITY_WEIGHTINGS = ("none", "target")
+EARLY_STOPPING_METRICS = (
+    "normalized_mse",
+    "rollout_state_rel_l2",
+    "objective_node_mse",
+    "weighted_total_loss",
+    "next_state_rmse",
+    "mass_mae",
+)
 FLUX_DECODER_EDGE_FEATURES = ("static", "processed")
 FLUX_SUPERVISION_STEPS = ("all", "first")
 
@@ -1262,6 +1283,7 @@ def autoregressive_batch(
     objective_node_sse = 0.0
     flux_normalized_sse = 0.0
     next_sse = 0.0
+    state_rel_l2_sum = 0.0
     mass_absolute_error = 0.0
     value_count = 0
     graph_step_count = 0
@@ -1373,6 +1395,22 @@ def autoregressive_batch(
             next_sse += float(F.mse_loss(
                 predicted_next, true_next, reduction="sum"
             ))
+            # Normalize each graph separately so large-density trajectories
+            # do not dominate the validation metric. Cell areas approximate
+            # the physical L2 integral on the unstructured mesh.
+            graph_squared_norms = true_next.new_zeros((int(batch.num_graphs), 2))
+            graph_squared_norms.index_add_(
+                0,
+                batch.batch,
+                batch.cell_area * torch.cat(
+                    ((predicted_next - true_next).square(), true_next.square()),
+                    dim=1,
+                ),
+            )
+            state_rel_l2_sum += float(torch.sqrt(
+                graph_squared_norms[:, 0]
+                / graph_squared_norms[:, 1].clamp_min(np.finfo(np.float64).eps)
+            ).sum())
             value_count += true_next.numel()
             node_mass_error = (
                 (predicted_next - true_next) * batch.cell_area
@@ -1397,6 +1435,7 @@ def autoregressive_batch(
             + flux_loss_weight * flux_normalized_mse
         ),
         "next_state_rmse": float(np.sqrt(next_sse / max(value_count, 1))),
+        "rollout_state_rel_l2": state_rel_l2_sum / max(graph_step_count, 1),
         "mass_mae": mass_absolute_error / max(graph_step_count, 1),
     }
     total_loss = (
@@ -1432,6 +1471,7 @@ def train_epoch(
         "flux_normalized_mse": 0.0,
         "weighted_total_loss": 0.0,
         "next_state_rmse_squared": 0.0,
+        "rollout_state_rel_l2": 0.0,
         "mass_mae": 0.0,
     }
     graph_steps = 0
@@ -1474,6 +1514,9 @@ def train_epoch(
             metrics["next_state_rmse"] ** 2 * weight
         )
         weighted_metrics["mass_mae"] += metrics["mass_mae"] * weight
+        weighted_metrics["rollout_state_rel_l2"] += (
+            metrics["rollout_state_rel_l2"] * weight
+        )
     divisor = max(graph_steps, 1)
     return {
         "normalized_mse": weighted_metrics["normalized_mse"] / divisor,
@@ -1486,6 +1529,7 @@ def train_epoch(
             np.sqrt(weighted_metrics["next_state_rmse_squared"] / divisor)
         ),
         "mass_mae": weighted_metrics["mass_mae"] / divisor,
+        "rollout_state_rel_l2": weighted_metrics["rollout_state_rel_l2"] / divisor,
     }
 
 
@@ -1515,6 +1559,7 @@ def evaluate(
         "flux_normalized_mse": 0.0,
         "weighted_total_loss": 0.0,
         "next_state_rmse_squared": 0.0,
+        "rollout_state_rel_l2": 0.0,
         "mass_mae": 0.0,
     }
     graph_steps = 0
@@ -1552,6 +1597,9 @@ def evaluate(
             metrics["next_state_rmse"] ** 2 * weight
         )
         accumulated["mass_mae"] += metrics["mass_mae"] * weight
+        accumulated["rollout_state_rel_l2"] += (
+            metrics["rollout_state_rel_l2"] * weight
+        )
     divisor = max(graph_steps, 1)
     return {
         "normalized_mse": accumulated["normalized_mse"] / divisor,
@@ -1562,6 +1610,7 @@ def evaluate(
             np.sqrt(accumulated["next_state_rmse_squared"] / divisor)
         ),
         "mass_mae": accumulated["mass_mae"] / divisor,
+        "rollout_state_rel_l2": accumulated["rollout_state_rel_l2"] / divisor,
     }
 
 
@@ -1834,10 +1883,24 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validation-fraction", type=float, default=0.15)
     parser.add_argument("--test-fraction", type=float, default=0.15)
     parser.add_argument(
+        "--early-stopping-metric",
+        choices=EARLY_STOPPING_METRICS,
+        default="normalized_mse",
+        help=(
+            "Validation metric minimized for patience and best-checkpoint "
+            "selection. rollout_state_rel_l2 averages cell-area-weighted "
+            "physical density relative L2 over graphs and rollout steps. "
+            "This does not change the training objective."
+        ),
+    )
+    parser.add_argument(
         "--patience",
         type=int,
         default=30,
-        help="Epochs without validation improvement; use 0 to disable.",
+        help=(
+            "Epochs without improvement in --early-stopping-metric; use 0 "
+            "to disable stopping while still selecting the best checkpoint."
+        ),
     )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument(
@@ -1893,6 +1956,11 @@ def resolved_config(args: argparse.Namespace) -> Dict[str, object]:
 
 
 def validate_args(args: argparse.Namespace, *, max_steps: int) -> None:
+    if args.early_stopping_metric not in EARLY_STOPPING_METRICS:
+        raise ValueError(
+            "early_stopping_metric must be one of "
+            f"{EARLY_STOPPING_METRICS}; got {args.early_stopping_metric!r}."
+        )
     if args.epochs <= 0 or args.batch_size <= 0 or args.hidden_channels <= 0:
         raise ValueError("epochs, batch_size, and hidden_channels must be positive.")
     minimum_layers = 2 if args.model == "sageconv" else 1
@@ -2160,6 +2228,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     print(f"node_density_weighting: {args.node_density_weighting}")
     print(f"node_density_weight_strength: {args.node_density_weight_strength}")
     print(f"autoregressive_steps: {args.autoregressive_steps}")
+    print(f"early_stopping_metric: {args.early_stopping_metric} (minimize)")
     print(f"mass_projection: {args.mass_projection}")
     print(f"decode_normalized_flux: {args.decode_normalized_flux}")
     print(f"flux_decoder_edge_features: {args.flux_decoder_edge_features}")
@@ -2214,6 +2283,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     best_state: Optional[Dict[str, Tensor]] = None
     best_validation = float("inf")
+    best_validation_metrics: Dict[str, float] = {}
     best_epoch = 0
     epochs_without_improvement = 0
     history: List[Dict[str, float]] = []
@@ -2263,9 +2333,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
         history.append(entry)
 
-        improved = validation_metrics["normalized_mse"] < best_validation
+        validation_score = validation_metrics[args.early_stopping_metric]
+        improved = np.isfinite(validation_score) and validation_score < best_validation
         if improved:
-            best_validation = validation_metrics["normalized_mse"]
+            best_validation = validation_score
+            best_validation_metrics = dict(validation_metrics)
             best_epoch = epoch
             best_state = copy.deepcopy(model.state_dict())
             epochs_without_improvement = 0
@@ -2293,18 +2365,24 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 f"train nMSE {train_metrics['normalized_mse']:.6e} | "
                 f"val nMSE {validation_metrics['normalized_mse']:.6e} | "
                 f"val state RMSE {validation_metrics['next_state_rmse']:.6e} | "
+                f"val state rel-L2 {validation_metrics['rollout_state_rel_l2']:.6e} | "
                 f"val mass MAE {validation_metrics['mass_mae']:.6e}"
                 f"{density_objective_text}"
                 f"{flux_text}"
+                f" | selection {args.early_stopping_metric}={validation_score:.6e}"
             )
         if args.patience > 0 and epochs_without_improvement >= args.patience:
             print(
-                f"early stopping at epoch {epoch}; best epoch was {best_epoch}"
+                f"early stopping at epoch {epoch}; best epoch was {best_epoch} "
+                f"(validation {args.early_stopping_metric}={best_validation:.6e})"
             )
             break
 
     if best_state is None:
-        raise RuntimeError("Training did not produce a checkpoint.")
+        raise RuntimeError(
+            "Training did not produce a checkpoint: no finite validation "
+            f"{args.early_stopping_metric} was observed."
+        )
     model.load_state_dict(best_state)
     test_metrics = evaluate(
         model,
@@ -2368,7 +2446,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             name: ids.tolist() for name, ids in split_ids.items()
         },
         "best_epoch": best_epoch,
-        "best_validation_normalized_mse": best_validation,
+        "early_stopping_metric": args.early_stopping_metric,
+        "best_validation_metric": best_validation,
+        "best_validation_metrics": best_validation_metrics,
+        "best_validation_normalized_mse": best_validation_metrics["normalized_mse"],
         "test_metrics": test_metrics,
         "history": history,
     }
@@ -2377,7 +2458,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         json.dump(history, stream, indent=2)
         stream.write("\n")
 
-    print(f"best epoch: {best_epoch}")
+    print(
+        f"best epoch: {best_epoch} "
+        f"(validation {args.early_stopping_metric}={best_validation:.6e})"
+    )
     print("test metrics:")
     print(json.dumps(test_metrics, indent=2, sort_keys=True))
     print(f"saved checkpoint: {checkpoint_path}")

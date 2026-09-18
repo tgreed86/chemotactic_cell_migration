@@ -2,8 +2,9 @@
 """Plot chemotaxis GNN training and validation histories.
 
 The checkpoint written by ``scripts/train.py`` contains the complete epoch
-history. This script plots the normalized autoregressive state-space MSE used
-for model selection and the corresponding physical density RMSE.
+history. This script plots normalized autoregressive node MSE, physical
+density RMSE, and cell-area-weighted state relative L2 when available. The
+best-epoch marker follows the validation metric selected during training.
 
 Example:
 
@@ -99,6 +100,11 @@ def plot_history(
         and "validation_next_state_rmse" in record
         for record in history
     )
+    has_state_rel_l2 = all(
+        "train_rollout_state_rel_l2" in record
+        and "validation_rollout_state_rel_l2" in record
+        for record in history
+    )
     all_plotted = [train_loss, validation_loss]
     if has_state_rmse:
         train_state_rmse = _history_array(history, "train_next_state_rmse")
@@ -106,27 +112,45 @@ def plot_history(
             history, "validation_next_state_rmse"
         )
         all_plotted.extend((train_state_rmse, validation_state_rmse))
+    if has_state_rel_l2:
+        train_state_rel_l2 = _history_array(history, "train_rollout_state_rel_l2")
+        validation_state_rel_l2 = _history_array(
+            history, "validation_rollout_state_rel_l2"
+        )
+        all_plotted.extend((train_state_rel_l2, validation_state_rel_l2))
     if yscale == "log" and any(np.any(values <= 0.0) for values in all_plotted):
         raise ValueError("A logarithmic axis requires strictly positive values.")
 
-    best_epoch = int(checkpoint.get("best_epoch", epochs[np.argmin(validation_loss)]))
-    matching = np.flatnonzero(epochs == best_epoch)
-    best_index = int(matching[0]) if matching.size else int(np.argmin(validation_loss))
+    selection_metric, best_index = best_history_index(checkpoint, history)
     best_epoch = int(epochs[best_index])
 
-    columns = 2 if has_state_rmse else 1
+    columns = 1 + int(has_state_rmse) + int(has_state_rel_l2)
     figure, axes = plt.subplots(
         1, columns, figsize=(7.5 * columns, 5.1), constrained_layout=True
     )
     axes_array = np.atleast_1d(axes)
 
+    training_args = checkpoint.get("training_args", {})
+    if not isinstance(training_args, Mapping):
+        training_args = {}
+    node_loss_normalization = str(
+        checkpoint.get(
+            "node_loss_normalization",
+            training_args.get("node_loss_normalization", "density"),
+        )
+    )
+    normalized_loss_ylabel = (
+        "Normalized target-space MSE"
+        if node_loss_normalization == "target"
+        else "Normalized state-space MSE"
+    )
     panels = [
         (
             axes_array[0],
             train_loss,
             validation_loss,
             "Normalized autoregressive loss",
-            "Normalized state-space MSE",
+            normalized_loss_ylabel,
         )
     ]
     if has_state_rmse:
@@ -137,6 +161,16 @@ def plot_history(
                 validation_state_rmse,
                 "Physical prediction error",
                 "Cell-density RMSE",
+            )
+        )
+    if has_state_rel_l2:
+        panels.append(
+            (
+                axes_array[len(panels)],
+                train_state_rel_l2,
+                validation_state_rel_l2,
+                "Physical relative prediction error",
+                r"Cell-area-weighted state relative $L_2$",
             )
         )
 
@@ -173,11 +207,35 @@ def plot_history(
     rollout_steps = checkpoint.get("autoregressive_steps", "?")
     figure.suptitle(
         f"{title}\n{model_name}; target={target_type}; "
-        f"training rollout={rollout_steps} step(s)"
+        f"training rollout={rollout_steps} step(s); selection={selection_metric}"
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close(figure)
+
+
+def best_history_index(
+    checkpoint: Mapping[str, object], history: Sequence[Mapping[str, object]]
+) -> Tuple[str, int]:
+    """Honor saved selection metadata, falling back to nMSE for old runs."""
+    training_args = checkpoint.get("training_args", {})
+    if not isinstance(training_args, Mapping):
+        training_args = {}
+    metric = str(checkpoint.get(
+        "early_stopping_metric",
+        training_args.get("early_stopping_metric", "normalized_mse"),
+    ))
+    values = _history_array(history, f"validation_{metric}")
+    best_index = int(np.argmin(values))
+    saved_epoch = checkpoint.get("best_epoch")
+    if saved_epoch is not None:
+        matching = [
+            index for index, record in enumerate(history)
+            if int(record["epoch"]) == int(saved_epoch)
+        ]
+        if matching:
+            best_index = matching[0]
+    return metric, best_index
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -217,19 +275,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         title=title,
         dpi=args.dpi,
     )
-    validation_loss = _history_array(history, "validation_normalized_mse")
-    best_index = int(np.argmin(validation_loss))
-    saved_best_epoch = int(checkpoint.get("best_epoch", history[best_index]["epoch"]))
-    matching = [
-        index
-        for index, record in enumerate(history)
-        if int(record["epoch"]) == saved_best_epoch
-    ]
-    if matching:
-        best_index = matching[0]
+    selection_metric, best_index = best_history_index(checkpoint, history)
+    selected_value = float(history[best_index][f"validation_{selection_metric}"])
     print(
         f"best validation epoch: {int(history[best_index]['epoch'])} "
-        f"(nMSE={validation_loss[best_index]:.6e})"
+        f"({selection_metric}={selected_value:.6e})"
     )
     print(f"saved plot: {output_path}")
 
